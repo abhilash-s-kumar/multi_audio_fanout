@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <RuntimeTypeInfo>false</RuntimeTypeInfo>
+      <BufferSecurityCheck>false</BufferSecurityCheck>
+      <PreprocessorDefinitions>_NO_CRT_STDIO_INLINE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalOptions>%(AdditionalOptions) /GR- /GS- /Zc:threadSafeInit-</AdditionalOptions>
+    </ClCompile>
+    <Link>
+      <Driver>Driver</Driver>
+      <EntryPointSymbol>FxDriverEntry</EntryPointSymbol>
+      <IgnoreAllDefaultLibraries>true</IgnoreAllDefaultLibraries>
+      <AdditionalDependencies>%(AdditionalDependencies);$(MafWdkRoot)Lib\10.0.28000.0\km\x64\ntoskrnl.lib;$(MafWdkRoot)Lib\10.0.28000.0\km\x64\hal.lib;$(MafWdkRoot)Lib\10.0.28000.0\km\x64\wmilib.lib;$(MafWdkRoot)Lib\10.0.28000.0\km\x64\portcls.lib;$(MafWdkRoot)Lib\10.0.28000.0\km\x64\stdunk.lib;$(MafWdkRoot)Lib\10.0.28000.0\km\x64\libcntpr.lib;$(MafWdkRoot)Lib\10.0.28000.0\km\x64\bufferoverflowfastfailk.lib;$(MafWdkRoot)Lib\10.0.28000.0\km\x64\ntstrsafe.lib;$(MafWdkRoot)Lib\wdf\kmdf\x64\1.35\WdfLdr.lib;$(MafWdkRoot)Lib\wdf\kmdf\x64\1.35\WdfDriverEntry.lib</AdditionalDependencies>
+      <AdditionalOptions>%(AdditionalOptions) /NODEFAULTLIB /SUBSYSTEM:NATIVE /MACHINE:X64</AdditionalOptions>
+      <GenerateManifest>false</GenerateManifest>
+    </Link>
+    <Inf>
+      <SpecifyArchitecture Condition="'%(Inf.SpecifyArchitecture)' == ''">true</SpecifyArchitecture>
+      <CopyOutput Condition="'%(Inf.CopyOutput)' == ''">$(IntDir)%(FileName).inf</CopyOutput>
+      <Architecture Condition="'%(Inf.Architecture)' == ''">$(InfArch)</Architecture>
+      <StampInfTrackerLogDirectory Condition="'%(Inf.StampInfTrackerLogDirectory)' == ''">$(TLogLocation)</StampInfTrackerLogDirectory>
+      <SpecifyDriverVerDirectiveDate Condition="'%(Inf.SpecifyDriverVerDirectiveDate)' == ''">true</SpecifyDriverVerDirectiveDate>
+      <SpecifyDriverVerDirectiveVersion Condition="'%(Inf.SpecifyDriverVerDirectiveVersion)' == ''">true</SpecifyDriverVerDirectiveVersion>
+      <DateStamp Condition="'%(Inf.DateStamp)' == ''">*</DateStamp>
+      <TimeStamp Condition="'%(Inf.TimeStamp)' == ''">*</TimeStamp>
+      <KmdfVersionNumber Condition="'%(Inf.KmdfVersionNumber)' == ''">$(KMDF_VERSION_MAJOR).$(KMDF_VERSION_MINOR)</KmdfVersionNumber>
+    </Inf>
+  </ItemDefinitionGroup>
+</Project>

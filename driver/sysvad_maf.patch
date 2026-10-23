@@ -1,0 +1,542 @@
+diff --git a/Directory.Build.props b/Directory.Build.props
+index 11951ae..2055067 100644
+--- a/Directory.Build.props
++++ b/Directory.Build.props
+@@ -1,7 +1,7 @@
+ <Project>
+ <Import Project="packages\Microsoft.Windows.WDK.x64.10.0.28000.1839\build\native\Microsoft.Windows.WDK.x64.props" Condition="Exists('packages\Microsoft.Windows.WDK.x64.10.0.28000.1839\build\native\Microsoft.Windows.WDK.x64.props') and '$(Platform)' == 'x64'"/>
+ <Import Project="packages\Microsoft.Windows.WDK.arm64.10.0.28000.1839\build\native\Microsoft.Windows.WDK.arm64.props" Condition="Exists('packages\Microsoft.Windows.WDK.arm64.10.0.28000.1839\build\native\Microsoft.Windows.WDK.arm64.props') and '$(Platform)' == 'ARM64'"/>
+-<Import Project="packages\Microsoft.Windows.SDK.CPP.x64.10.0.28000.1839\build\native\Microsoft.Windows.SDK.cpp.x64.props" Condition="Exists('packages\Microsoft.Windows.SDK.CPP.x64.10.0.28000.1839\build\native\Microsoft.Windows.SDK.cpp.x64.props') and '$(Platform)' == 'x64'"/>
++<Import Project="packages\Microsoft.Windows.SDK.CPP.x64.10.0.28000.1721\build\native\Microsoft.Windows.SDK.cpp.x64.props" Condition="Exists('packages\Microsoft.Windows.SDK.CPP.x64.10.0.28000.1721\build\native\Microsoft.Windows.SDK.cpp.x64.props') and '$(Platform)' == 'x64'"/>
+ <Import Project="packages\Microsoft.Windows.SDK.CPP.arm64.10.0.28000.1839\build\native\Microsoft.Windows.SDK.cpp.arm64.props" Condition="Exists('packages\Microsoft.Windows.SDK.CPP.arm64.10.0.28000.1839\build\native\Microsoft.Windows.SDK.cpp.arm64.props') and '$(Platform)' == 'ARM64'"/>
+-<Import Project="packages\Microsoft.Windows.SDK.CPP.10.0.28000.1839\build\native\Microsoft.Windows.SDK.cpp.props" Condition="Exists('packages\Microsoft.Windows.SDK.CPP.10.0.28000.1839\build\native\Microsoft.Windows.SDK.cpp.props')"/>
++<Import Project="packages\Microsoft.Windows.SDK.CPP.10.0.28000.1721\build\native\Microsoft.Windows.SDK.cpp.props" Condition="Exists('packages\Microsoft.Windows.SDK.CPP.10.0.28000.1721\build\native\Microsoft.Windows.SDK.cpp.props')"/>
+ </Project>
+diff --git a/audio/sysvad/EndpointsCommon/minwavert.cpp b/audio/sysvad/EndpointsCommon/minwavert.cpp
+index c6b8e8c..b2f8aba 100644
+--- a/audio/sysvad/EndpointsCommon/minwavert.cpp
++++ b/audio/sysvad/EndpointsCommon/minwavert.cpp
+@@ -187,6 +187,12 @@ Return Value:
+         m_LoopbackStreams = NULL;
+     }
+ 
++    if (m_LoopbackRing)
++    {
++        ExFreePoolWithTag(m_LoopbackRing, MINWAVERT_POOLTAG);
++        m_LoopbackRing = NULL;
++    }
++
+     if (m_pAudioModules)
+     {
+         FreeStreamAudioModules(m_pAudioModules, GetAudioModuleListCount());
+@@ -395,6 +401,10 @@ Return Value:
+     m_SystemStreams                     = NULL;
+     m_OffloadStreams                    = NULL;
+     m_LoopbackStreams                   = NULL;
++    m_LoopbackRing                      = NULL;
++    m_LoopbackFrontier                  = 0;
++    m_LoopbackBaseQpc.QuadPart          = 0;
++    m_LoopbackQpcFrequency.QuadPart     = 0;
+     m_bGfxEnabled                       = FALSE;
+     m_pbMuted                           = NULL;
+     m_plVolumeLevel                     = NULL;
+@@ -404,6 +414,7 @@ Return Value:
+     m_ulMixDrmContentId                 = 0;
+     m_LoopbackProtection                = CONSTRICTOR_OPTION_DISABLE;
+     RtlZeroMemory(&m_MixDrmRights, sizeof(m_MixDrmRights));
++    KeInitializeSpinLock(&m_LoopbackBufferLock);
+ 
+     // 
+     // For port notification support.
+@@ -1233,6 +1244,11 @@ CMiniportWaveRT::StreamCreated
+     else if (IsLoopbackPin(_Pin))
+     {
+         ALLOCATE_PIN_INSTANCE_RESOURCES(m_ulLoopbackAllocated);
++        if (!NT_SUCCESS(EnsureLoopbackRing()))
++        {
++            FREE_PIN_INSTANCE_RESOURCES(m_ulLoopbackAllocated);
++            return STATUS_INSUFFICIENT_RESOURCES;
++        }
+         streams = m_LoopbackStreams;
+         count = m_ulMaxLoopbackStreams;
+         _Stream->m_SaveData.Disable(m_MixDrmRights.CopyProtect);
+@@ -1242,10 +1258,21 @@ CMiniportWaveRT::StreamCreated
+         ALLOCATE_PIN_INSTANCE_RESOURCES(m_ulSystemAllocated);
+         streams = m_SystemStreams;
+         count = m_ulMaxSystemStreams;
++
++        if (!NT_SUCCESS(EnsureLoopbackRing()))
++        {
++            FREE_PIN_INSTANCE_RESOURCES(m_ulSystemAllocated);
++            return STATUS_INSUFFICIENT_RESOURCES;
++        }
+     }
+     else if (IsOffloadPin(_Pin))
+     {
+         ALLOCATE_PIN_INSTANCE_RESOURCES(m_ulOffloadAllocated);
++        if (!NT_SUCCESS(EnsureLoopbackRing()))
++        {
++            FREE_PIN_INSTANCE_RESOURCES(m_ulOffloadAllocated);
++            return STATUS_INSUFFICIENT_RESOURCES;
++        }
+         streams = m_OffloadStreams;
+         count = m_ulMaxOffloadStreams;
+     }
+@@ -1444,6 +1471,281 @@ Remarks
+     return STATUS_SUCCESS;
+ }
+ 
++//=============================================================================
++#pragma code_seg()
++NTSTATUS
++CMiniportWaveRT::EnsureLoopbackRing()
++{
++    if (m_LoopbackRing != NULL)
++    {
++        return STATUS_SUCCESS;
++    }
++
++    SHORT* ring = (SHORT*)ExAllocatePool2(POOL_FLAG_NON_PAGED, LOOPBACK_MIX_RING_FRAMES * 2 * sizeof(SHORT), MINWAVERT_POOLTAG);
++    if (ring == NULL)
++    {
++        return STATUS_INSUFFICIENT_RESOURCES;
++    }
++
++    KIRQL oldIrql;
++    KeAcquireSpinLock(&m_LoopbackBufferLock, &oldIrql);
++    if (m_LoopbackRing == NULL)
++    {
++        m_LoopbackBaseQpc = KeQueryPerformanceCounter(&m_LoopbackQpcFrequency);
++        m_LoopbackFrontier = 0;
++        m_LoopbackRing = ring;
++        ring = NULL;
++    }
++    KeReleaseSpinLock(&m_LoopbackBufferLock, oldIrql);
++
++    if (ring != NULL)
++    {
++        ExFreePoolWithTag(ring, MINWAVERT_POOLTAG);
++    }
++    return STATUS_SUCCESS;
++}
++
++//=============================================================================
++#pragma code_seg()
++LONGLONG
++CMiniportWaveRT::LoopbackNowFrame(_In_ LARGE_INTEGER Qpc)
++{
++    // Ring frame playing at Qpc. Split so the multiply cannot overflow.
++    LONGLONG ticks = Qpc.QuadPart - m_LoopbackBaseQpc.QuadPart;
++    LONGLONG freq = m_LoopbackQpcFrequency.QuadPart;
++    if (ticks < 0 || freq <= 0)
++    {
++        return 0;
++    }
++    return (ticks / freq) * LOOPBACK_MIX_RATE + ((ticks % freq) * LOOPBACK_MIX_RATE) / freq;
++}
++
++//=============================================================================
++#pragma code_seg()
++VOID
++CMiniportWaveRT::LoopbackAdvanceFrontier(_In_ LONGLONG EndFrame)
++{
++    // Clear ring frames [frontier, EndFrame) so writers can add into them.
++    // Called with m_LoopbackBufferLock held.
++    if (EndFrame <= m_LoopbackFrontier)
++    {
++        return;
++    }
++
++    LONGLONG start = m_LoopbackFrontier;
++    if (EndFrame - start > LOOPBACK_MIX_RING_FRAMES)
++    {
++        start = EndFrame - LOOPBACK_MIX_RING_FRAMES;
++    }
++    while (start < EndFrame)
++    {
++        ULONG offset = (ULONG)(start % LOOPBACK_MIX_RING_FRAMES);
++        ULONG run = (ULONG)min((LONGLONG)(LOOPBACK_MIX_RING_FRAMES - offset), EndFrame - start);
++        RtlZeroMemory(m_LoopbackRing + offset * 2, run * 2 * sizeof(SHORT));
++        start += run;
++    }
++    m_LoopbackFrontier = EndFrame;
++}
++
++//=============================================================================
++#pragma code_seg()
++VOID
++CMiniportWaveRT::MixRenderIntoLoopback
++(
++    _Inout_ PLOOPBACK_CURSOR Cursor,
++    _In_reads_bytes_(DmaBufferSize) BYTE* DmaBuffer,
++    _In_ ULONG DmaBufferSize,
++    _In_ ULONGLONG LinearPosition,
++    _In_ ULONG ByteCount,
++    _In_ ULONG SampleRate,
++    _In_ LARGE_INTEGER Qpc
++)
++/*++
++
++Routine Description:
++
++  Adds the frames a render stream played since its last position update into
++  the loopback ring at the time they played. Only 16-bit stereo is handled,
++  which is every format the speaker pins expose.
++
++--*/
++{
++    if (Cursor == NULL || DmaBuffer == NULL || ByteCount == 0 || DmaBufferSize < 4 || SampleRate == 0 || m_LoopbackRing == NULL)
++    {
++        return;
++    }
++
++    // Whole frames completed in [LinearPosition, LinearPosition + ByteCount).
++    ULONGLONG firstFrame = LinearPosition / 4;
++    ULONGLONG endFrame = (LinearPosition + ByteCount) / 4;
++    ULONG dmaFrames = DmaBufferSize / 4;
++    if (endFrame <= firstFrame || dmaFrames == 0)
++    {
++        return;
++    }
++    if (endFrame - firstFrame > dmaFrames)
++    {
++        // More time passed than the buffer holds, so audio was lost: realign to the clock.
++        firstFrame = endFrame - dmaFrames;
++        Cursor->Valid = FALSE;
++    }
++    ULONG frames = (ULONG)(endFrame - firstFrame);
++    ULONGLONG step = ((ULONGLONG)SampleRate << 32) / LOOPBACK_MIX_RATE;
++    LONGLONG ringFrames = (LONGLONG)(((ULONGLONG)frames << 32) / step);
++
++    KIRQL oldIrql;
++    KeAcquireSpinLock(&m_LoopbackBufferLock, &oldIrql);
++
++    LONGLONG now = LoopbackNowFrame(Qpc);
++    LONGLONG tolerance = (LOOPBACK_MIX_RATE * LOOPBACK_MIX_RESYNC_MS) / 1000;
++    if (!Cursor->Valid ||
++        Cursor->RingFrame + ringFrames > now + tolerance ||
++        Cursor->RingFrame + ringFrames < now - tolerance)
++    {
++        // First update, or the stream paused or drifted: place these frames so they end now.
++        SHORT* first = (SHORT*)(DmaBuffer + (ULONG)(firstFrame % dmaFrames) * 4);
++        Cursor->Valid = TRUE;
++        Cursor->RingFrame = now - ringFrames;
++        Cursor->Phase = 0;
++        Cursor->Previous[0] = first[0];
++        Cursor->Previous[1] = first[1];
++    }
++
++    LoopbackAdvanceFrontier(Cursor->RingFrame + ringFrames + 1);
++
++    for (ULONG i = 0; i < frames; ++i)
++    {
++        SHORT* frame = (SHORT*)(DmaBuffer + (ULONG)((firstFrame + i) % dmaFrames) * 4);
++
++        // Emit the ring frames that fall between Previous (position 0) and frame (position 1).
++        while (Cursor->Phase < (1ULL << 32))
++        {
++            LONGLONG fraction = (LONGLONG)Cursor->Phase;
++            if (Cursor->RingFrame >= 0 && Cursor->RingFrame >= m_LoopbackFrontier - LOOPBACK_MIX_RING_FRAMES && Cursor->RingFrame < m_LoopbackFrontier)
++            {
++                SHORT* out = m_LoopbackRing + (ULONG)(Cursor->RingFrame % LOOPBACK_MIX_RING_FRAMES) * 2;
++                for (ULONG ch = 0; ch < 2; ++ch)
++                {
++                    LONG value = Cursor->Previous[ch] + (LONG)((((LONGLONG)frame[ch] - Cursor->Previous[ch]) * fraction) >> 32);
++                    LONG mixed = out[ch] + value;
++                    out[ch] = (SHORT)(mixed > SHRT_MAX ? SHRT_MAX : (mixed < SHRT_MIN ? SHRT_MIN : mixed));
++                }
++            }
++            Cursor->RingFrame++;
++            Cursor->Phase += step;
++        }
++        Cursor->Phase -= (1ULL << 32);
++        Cursor->Previous[0] = frame[0];
++        Cursor->Previous[1] = frame[1];
++    }
++
++    KeReleaseSpinLock(&m_LoopbackBufferLock, oldIrql);
++}
++
++//=============================================================================
++#pragma code_seg()
++VOID
++CMiniportWaveRT::ReadLoopbackMix
++(
++    _Inout_ PLOOPBACK_CURSOR Cursor,
++    _Out_writes_bytes_(DmaBufferSize) BYTE* DmaBuffer,
++    _In_ ULONG DmaBufferSize,
++    _In_ ULONGLONG LinearPosition,
++    _In_ ULONG ByteCount,
++    _In_ ULONG SampleRate,
++    _In_ LARGE_INTEGER Qpc
++)
++/*++
++
++Routine Description:
++
++  Fills the frames a loopback stream captured since its last position update
++  with the ring mix from LOOPBACK_MIX_DELAY_MS ago. Ring frames no stream
++  wrote read as silence.
++
++--*/
++{
++    if (Cursor == NULL || DmaBuffer == NULL || ByteCount == 0 || DmaBufferSize < 4 || SampleRate == 0)
++    {
++        return;
++    }
++
++    ULONGLONG firstFrame = LinearPosition / 4;
++    ULONGLONG endFrame = (LinearPosition + ByteCount) / 4;
++    ULONG dmaFrames = DmaBufferSize / 4;
++    if (endFrame <= firstFrame || dmaFrames == 0)
++    {
++        return;
++    }
++    if (endFrame - firstFrame > dmaFrames)
++    {
++        // More time passed than the buffer holds, so audio was lost: realign to the clock.
++        firstFrame = endFrame - dmaFrames;
++        Cursor->Valid = FALSE;
++    }
++    ULONG frames = (ULONG)(endFrame - firstFrame);
++
++    if (m_LoopbackRing == NULL)
++    {
++        for (ULONG i = 0; i < frames; ++i)
++        {
++            *(ULONG*)(DmaBuffer + (ULONG)((firstFrame + i) % dmaFrames) * 4) = 0;
++        }
++        return;
++    }
++
++    ULONGLONG step = ((ULONGLONG)LOOPBACK_MIX_RATE << 32) / SampleRate;
++    LONGLONG ringFrames = (LONGLONG)(((ULONGLONG)frames * step) >> 32);
++
++    KIRQL oldIrql;
++    KeAcquireSpinLock(&m_LoopbackBufferLock, &oldIrql);
++
++    LONGLONG target = LoopbackNowFrame(Qpc) - (LOOPBACK_MIX_RATE * LOOPBACK_MIX_DELAY_MS) / 1000;
++    LONGLONG tolerance = (LOOPBACK_MIX_RATE * LOOPBACK_MIX_RESYNC_MS) / 1000;
++    if (!Cursor->Valid ||
++        Cursor->RingFrame + ringFrames > target + tolerance ||
++        Cursor->RingFrame + ringFrames < target - tolerance)
++    {
++        Cursor->Valid = TRUE;
++        Cursor->RingFrame = target - ringFrames;
++        Cursor->Phase = 0;
++        Cursor->Previous[0] = Cursor->Previous[1] = 0;
++        Cursor->Next[0] = Cursor->Next[1] = 0;
++    }
++
++    for (ULONG i = 0; i < frames; ++i)
++    {
++        // Step through ring frames until the output position lies between Previous and Next.
++        while (Cursor->Phase >= (1ULL << 32))
++        {
++            LONGLONG index = Cursor->RingFrame++;
++            Cursor->Phase -= (1ULL << 32);
++            Cursor->Previous[0] = Cursor->Next[0];
++            Cursor->Previous[1] = Cursor->Next[1];
++            if (index >= 0 && index < m_LoopbackFrontier && index >= m_LoopbackFrontier - LOOPBACK_MIX_RING_FRAMES)
++            {
++                SHORT* in = m_LoopbackRing + (ULONG)(index % LOOPBACK_MIX_RING_FRAMES) * 2;
++                Cursor->Next[0] = in[0];
++                Cursor->Next[1] = in[1];
++            }
++            else
++            {
++                Cursor->Next[0] = Cursor->Next[1] = 0;
++            }
++        }
++
++        LONGLONG fraction = (LONGLONG)Cursor->Phase;
++        SHORT* out = (SHORT*)(DmaBuffer + (ULONG)((firstFrame + i) % dmaFrames) * 4);
++        for (ULONG ch = 0; ch < 2; ++ch)
++        {
++            out[ch] = (SHORT)(Cursor->Previous[ch] + (LONG)((((LONGLONG)Cursor->Next[ch] - Cursor->Previous[ch]) * fraction) >> 32));
++        }
++        Cursor->Phase += step;
++    }
++
++    KeReleaseSpinLock(&m_LoopbackBufferLock, oldIrql);
++}
++
+ //=============================================================================
+ #pragma code_seg("PAGE")
+ NTSTATUS
+diff --git a/audio/sysvad/EndpointsCommon/minwavert.h b/audio/sysvad/EndpointsCommon/minwavert.h
+index 42cad96..4ffb277 100644
+--- a/audio/sysvad/EndpointsCommon/minwavert.h
++++ b/audio/sysvad/EndpointsCommon/minwavert.h
+@@ -28,6 +28,28 @@ Abstract:
+ class CMiniportWaveRTStream;
+ typedef CMiniportWaveRTStream *PCMiniportWaveRTStream;
+ 
++//=============================================================================
++// Loopback mixer
++//=============================================================================
++// Every render stream (system pins for each mode, offload pins) is mixed into
++// one 16-bit stereo ring at LOOPBACK_MIX_RATE, indexed by QPC time. The loopback
++// pin reads it back LOOPBACK_MIX_DELAY_MS behind real time. Streams at other
++// rates are converted with linear interpolation.
++#define LOOPBACK_MIX_RATE               48000
++#define LOOPBACK_MIX_RING_SECONDS       2
++#define LOOPBACK_MIX_RING_FRAMES        (LOOPBACK_MIX_RATE * LOOPBACK_MIX_RING_SECONDS)
++#define LOOPBACK_MIX_DELAY_MS           40
++#define LOOPBACK_MIX_RESYNC_MS          20
++
++typedef struct _LOOPBACK_CURSOR
++{
++    BOOLEAN     Valid;
++    LONGLONG    RingFrame;      // next ring frame this stream writes or reads
++    ULONGLONG   Phase;          // resampler position, Q32
++    SHORT       Previous[2];    // last frame seen by the resampler
++    SHORT       Next[2];        // reader only: frame after Previous
++} LOOPBACK_CURSOR, *PLOOPBACK_CURSOR;
++
+ //=============================================================================
+ // Classes
+ //=============================================================================
+@@ -150,6 +172,12 @@ private:
+     PCMiniportWaveRTStream            * m_OffloadStreams;
+     PCMiniportWaveRTStream            * m_LoopbackStreams;
+ 
++    SHORT                             * m_LoopbackRing;         // LOOPBACK_MIX_RING_FRAMES stereo frames
++    LONGLONG                            m_LoopbackFrontier;     // ring frames below this are mixed or cleared
++    LARGE_INTEGER                       m_LoopbackBaseQpc;
++    LARGE_INTEGER                       m_LoopbackQpcFrequency;
++    KSPIN_LOCK                          m_LoopbackBufferLock;
++
+     BOOL                                m_bGfxEnabled;
+     PBOOL                               m_pbMuted;
+     PLONG                               m_plVolumeLevel;
+@@ -231,6 +259,36 @@ public:
+         _In_ ULONG _Pin,
+         _In_ PCMiniportWaveRTStream _Stream
+     );
++
++    NTSTATUS EnsureLoopbackRing();
++
++    VOID MixRenderIntoLoopback
++    (
++        _Inout_ PLOOPBACK_CURSOR Cursor,
++        _In_reads_bytes_(DmaBufferSize) BYTE* DmaBuffer,
++        _In_ ULONG DmaBufferSize,
++        _In_ ULONGLONG LinearPosition,
++        _In_ ULONG ByteCount,
++        _In_ ULONG SampleRate,
++        _In_ LARGE_INTEGER Qpc
++    );
++
++    VOID ReadLoopbackMix
++    (
++        _Inout_ PLOOPBACK_CURSOR Cursor,
++        _Out_writes_bytes_(DmaBufferSize) BYTE* DmaBuffer,
++        _In_ ULONG DmaBufferSize,
++        _In_ ULONGLONG LinearPosition,
++        _In_ ULONG ByteCount,
++        _In_ ULONG SampleRate,
++        _In_ LARGE_INTEGER Qpc
++    );
++
++private:
++    LONGLONG LoopbackNowFrame(_In_ LARGE_INTEGER Qpc);
++    VOID LoopbackAdvanceFrontier(_In_ LONGLONG EndFrame);
++
++public:
+     
+     NTSTATUS IsFormatSupported
+     ( 
+diff --git a/audio/sysvad/EndpointsCommon/minwavertstream.cpp b/audio/sysvad/EndpointsCommon/minwavertstream.cpp
+index adea0c8..449fcd7 100644
+--- a/audio/sysvad/EndpointsCommon/minwavertstream.cpp
++++ b/audio/sysvad/EndpointsCommon/minwavertstream.cpp
+@@ -239,6 +239,7 @@ Return Value:
+     m_pWfExt = NULL;
+     m_ullLinearPosition = 0;
+     m_ullPresentationPosition = 0;
++    RtlZeroMemory(&m_LoopbackCursor, sizeof(m_LoopbackCursor));
+     m_ulContentId = 0;
+     m_ulCurrentWritePosition = 0;
+     m_ulLastOsReadPacket = ULONG_MAX;
+@@ -1427,8 +1428,16 @@ VOID CMiniportWaveRTStream::UpdatePosition
+ 
+     if (m_bCapture)
+     {
+-        // Write sine wave to buffer.
+-        WriteBytes(ByteDisplacement);
++        // Fill the loopback DMA from the mixed render ring.
++        m_pMiniport->ReadLoopbackMix(
++            &m_LoopbackCursor,
++            m_pDmaBuffer,
++            m_ulDmaBufferSize,
++            m_ullLinearPosition,
++            ByteDisplacement,
++            m_pWfExt->Format.nSamplesPerSec,
++            ilQPC
++        );
+     }
+     else
+     {
+@@ -1469,6 +1478,19 @@ VOID CMiniportWaveRTStream::UpdatePosition
+                                         0);
+         }
+ 
++        if (ByteDisplacement > 0)
++        {
++            m_pMiniport->MixRenderIntoLoopback(
++                &m_LoopbackCursor,
++                m_pDmaBuffer,
++                m_ulDmaBufferSize,
++                m_ullLinearPosition,
++                ByteDisplacement,
++                m_pWfExt->Format.nSamplesPerSec,
++                ilQPC
++            );
++        }
++
+         if (!g_DoNotCreateDataFiles)
+         {
+             // Read from buffer and write to a file.
+diff --git a/audio/sysvad/EndpointsCommon/minwavertstream.h b/audio/sysvad/EndpointsCommon/minwavertstream.h
+index 4e9e882..35e64d4 100644
+--- a/audio/sysvad/EndpointsCommon/minwavertstream.h
++++ b/audio/sysvad/EndpointsCommon/minwavertstream.h
+@@ -103,6 +103,7 @@ protected:
+     ULONGLONG                   m_ullWritePosition;
+     ULONGLONG                   m_ullLinearPosition;
+     ULONGLONG                   m_ullPresentationPosition;
++    LOOPBACK_CURSOR             m_LoopbackCursor;
+     ULONG                       m_ulLastOsReadPacket;
+     ULONG                       m_ulLastOsWritePacket;
+     LONGLONG                    m_llPacketCounter;
+diff --git a/audio/sysvad/TabletAudioSample/minipairs.h b/audio/sysvad/TabletAudioSample/minipairs.h
+index 0d00f5a..917fed4 100644
+--- a/audio/sysvad/TabletAudioSample/minipairs.h
++++ b/audio/sysvad/TabletAudioSample/minipairs.h
+@@ -510,9 +510,6 @@ static
+ PENDPOINT_MINIPAIR  g_RenderEndpoints[] = 
+ {
+     &SpeakerMiniports,
+-    &SpeakerHpMiniports,
+-    &HdmiMiniports,
+-    &SpdifMiniports,
+ };
+ 
+ #define g_cRenderEndpoints  (SIZEOF_ARRAY(g_RenderEndpoints))
+@@ -524,13 +521,10 @@ PENDPOINT_MINIPAIR  g_RenderEndpoints[] =
+ static
+ PENDPOINT_MINIPAIR  g_CaptureEndpoints[] = 
+ {
+-    &MicInMiniports,
+-    &MicArray1Miniports,
+-    &MicArray2Miniports,
+-    &MicArray3Miniports,
++    NULL,
+ };
+ 
+-#define g_cCaptureEndpoints (SIZEOF_ARRAY(g_CaptureEndpoints))
++#define g_cCaptureEndpoints 0
+ 
+ //=============================================================================
+ //

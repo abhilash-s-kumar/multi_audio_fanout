@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project>
+  <!-- WDK and SDK NuGet packages. Windows-driver-samples\packages links to the project's packages folder. -->
+  <Import Project="$(MSBuildThisFileDirectory)..\..\Directory.Build.props" />
+  <PropertyGroup>
+    <SpectreMitigation>false</SpectreMitigation>
+    <WindowsTargetPlatformVersion>10.0.28000.0</WindowsTargetPlatformVersion>
+    <MafWdkRoot>$(MSBuildThisFileDirectory)..\..\packages\Microsoft.Windows.WDK.x64.10.0.28000.1839\c\</MafWdkRoot>
+    <MafSdkRoot>$(MSBuildThisFileDirectory)..\..\packages\Microsoft.Windows.SDK.CPP.10.0.28000.1721\c\</MafSdkRoot>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <AdditionalIncludeDirectories>$(MafWdkRoot)Include\wdf\kmdf\1.35;$(MafWdkRoot)Include\10.0.28000.0\km;$(MafWdkRoot)Include\10.0.28000.0\shared;$(MafSdkRoot)Include\10.0.28000.0\shared;$(MafSdkRoot)Include\10.0.28000.0\um;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>_AMD64_;AMD64;_WIN64;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <DisableSpecificWarnings>4324;%(DisableSpecificWarnings)</DisableSpecificWarnings>
+    </ClCompile>
+    <Link>
+      <AdditionalLibraryDirectories>$(MafWdkRoot)Lib\10.0.28000.0\km\x64;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+    </Link>
+  </ItemDefinitionGroup>
+</Project>

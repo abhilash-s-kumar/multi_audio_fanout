@@ -25,6 +25,7 @@ import numpy as np
 import soundcard as sc
 
 from fanout import BLOCK_FRAMES, SAMPLE_RATE, device_name, normalize_block
+import maf_driver
 
 
 APP_NAME = "MAF"
@@ -900,6 +901,12 @@ class MAFApp(tk.Tk):
         self._calibration_report: list[str] = []
         self._name_resize_start_x = 0
         self._name_resize_start_width = self.output_name_width
+        self.driver_button_text = tk.StringVar(value="Driver")
+        self.driver_dialog: DriverDialog | None = None
+        self.driver_summary: maf_driver.DriverSummary | None = None
+        self._driver_checking = False
+        self._driver_installing = False
+        self._driver_first_check = True
 
         self._build_ui()
         self._update_sync_button()
@@ -911,6 +918,7 @@ class MAFApp(tk.Tk):
         self.after(VISUALIZER_REFRESH_MS, self._draw_visualizer)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._log("MAF ready")
+        self.after(500, self.check_driver)
 
     def _build_ui(self) -> None:
         outer = ttk.Frame(self, padding=14)
@@ -924,6 +932,7 @@ class MAFApp(tk.Tk):
         self.source_combo.pack(side=tk.LEFT, padx=(10, 8), fill=tk.X, expand=True)
         self.source_combo.bind("<<ComboboxSelected>>", lambda _event: self._render_outputs())
         ttk.Button(top, text="Refresh", command=self.refresh_devices).pack(side=tk.LEFT)
+        ttk.Button(top, textvariable=self.driver_button_text, command=self.open_driver_dialog).pack(side=tk.LEFT, padx=(8, 0))
 
         volume_row = ttk.Frame(outer)
         volume_row.pack(fill=tk.X, pady=(14, 8))
@@ -1682,6 +1691,10 @@ class MAFApp(tk.Tk):
                     self.status_var.set(str(event[1]))
                 elif event[0] == "calibration" and len(event) >= 2 and isinstance(event[1], dict):
                     self._handle_calibration_event(event[1])
+                elif event[0] == "driver_status" and len(event) >= 2:
+                    self._on_driver_status(event[1])
+                elif event[0] == "driver_install_done" and len(event) >= 3:
+                    self._on_driver_install_done(int(event[1]), str(event[2]))
                 elif event[0] == "device_status" and len(event) >= 3:
                     name = str(event[1])
                     text = str(event[2])
@@ -1742,9 +1755,186 @@ class MAFApp(tk.Tk):
         self._native_restarts.append(now)
         return True
 
+    def check_driver(self) -> None:
+        if self._driver_checking:
+            return
+        self._driver_checking = True
+        if self.driver_dialog:
+            self.driver_dialog.set_busy("Checking the driver...")
+
+        def worker() -> None:
+            self.status_queue.put(("driver_status", maf_driver.query_status()))
+
+        threading.Thread(target=worker, name="MAFDriverStatus", daemon=True).start()
+
+    def _on_driver_status(self, status: dict | None) -> None:
+        self._driver_checking = False
+        summary = maf_driver.summarize(status)
+        previous = self.driver_summary
+        self.driver_summary = summary
+        self.driver_button_text.set("Driver" if summary.level == maf_driver.OK else "Driver (!)")
+        if summary.level != maf_driver.OK and (previous is None or previous.headline != summary.headline):
+            self._log(f"Driver: {summary.headline}")
+        if self.driver_dialog:
+            self.driver_dialog.show_summary(summary)
+        first_check = self._driver_first_check
+        self._driver_first_check = False
+        if first_check and summary.level == maf_driver.ERROR and not any(is_maf_endpoint(s.name) for s in self.sources):
+            self.open_driver_dialog()
+
+    def open_driver_dialog(self) -> None:
+        if self.driver_dialog and self.driver_dialog.winfo_exists():
+            self.driver_dialog.lift()
+            self.driver_dialog.focus_set()
+            return
+        self.driver_dialog = DriverDialog(self)
+        if self.driver_summary:
+            self.driver_dialog.show_summary(self.driver_summary)
+        if not self._driver_installing:
+            self.check_driver()
+
+    def install_driver(self, clean: bool) -> None:
+        if self._driver_installing:
+            return
+        text = (
+            "Windows will ask for administrator permission.\n\n"
+            "Sound through the MAF output stops for a few seconds while the driver is replaced; "
+            "MAF reconnects by itself."
+        )
+        if clean:
+            text += "\n\nA clean reinstall removes the MAF device first, so Windows may switch the default output. MAF sets it back."
+        if not messagebox.askokcancel("Install MAF driver", text, parent=self.driver_dialog or self):
+            return
+        self._driver_installing = True
+        if self.driver_dialog:
+            self.driver_dialog.set_busy("Installing... approve the administrator prompt, then wait for the PowerShell window to close.")
+        self._log("Driver: installing" + (" (clean)" if clean else ""))
+
+        def worker() -> None:
+            try:
+                code, log = maf_driver.run_install_elevated(clean=clean)
+            except Exception as exc:  # keep the UI usable whatever happens
+                code, log = maf_driver.EXIT_FAILED, str(exc)
+            self.status_queue.put(("driver_install_done", code, log))
+
+        threading.Thread(target=worker, name="MAFDriverInstall", daemon=True).start()
+
+    def _on_driver_install_done(self, code: int, log: str) -> None:
+        self._driver_installing = False
+        level, message = maf_driver.exit_code_message(code)
+        self._log(f"Driver: {message}")
+        if self.driver_dialog and self.driver_dialog.winfo_exists():
+            self.driver_dialog.show_install_result(level, message, log)
+        elif level == maf_driver.ERROR:
+            messagebox.showerror("MAF driver", message, parent=self)
+        self.check_driver()
+        self.after(1500, self.refresh_devices)
+
     def _on_close(self) -> None:
         self.stop()
         self.destroy()
+
+
+class DriverDialog(tk.Toplevel):
+    LEVEL_COLOURS = {maf_driver.OK: "#1b7f3a", maf_driver.WARNING: "#a15c00", maf_driver.ERROR: "#b3261e"}
+    ACTION_LABELS = {
+        "install": "Install driver",
+        "update": "Update driver",
+        "clean": "Reinstall driver",
+        "restart": "Install again",
+        None: "Install again",
+    }
+
+    def __init__(self, app: MAFApp) -> None:
+        super().__init__(app)
+        self.app = app
+        self.title("MAF Driver")
+        self.geometry("620x560")
+        self.minsize(520, 460)
+        self.transient(app)
+        self.summary: maf_driver.DriverSummary | None = None
+
+        body = ttk.Frame(self, padding=14)
+        body.pack(fill=tk.BOTH, expand=True)
+
+        heading_font = font.nametofont("TkDefaultFont").copy()
+        heading_font.configure(weight="bold", size=heading_font.cget("size") + 1)
+        self.headline_var = tk.StringVar(value="Checking the driver...")
+        self.headline = tk.Label(body, textvariable=self.headline_var, font=heading_font, anchor="w", justify=tk.LEFT, wraplength=580)
+        self.headline.pack(fill=tk.X)
+
+        self.details_var = tk.StringVar()
+        ttk.Label(body, textvariable=self.details_var, justify=tk.LEFT).pack(fill=tk.X, pady=(8, 0))
+
+        steps_frame = ttk.LabelFrame(body, text="Manual steps", padding=8)
+        steps_frame.pack(fill=tk.BOTH, expand=True, pady=(12, 0))
+        self.steps_text = tk.Text(steps_frame, height=7, wrap=tk.WORD)
+        self.steps_text.pack(fill=tk.BOTH, expand=True)
+        ttk.Button(steps_frame, text="Copy steps", command=self._copy_steps).pack(anchor="e", pady=(6, 0))
+
+        self.result_frame = ttk.LabelFrame(body, text="Last install", padding=8)
+        self.result_var = tk.StringVar()
+        self.result_label = tk.Label(self.result_frame, textvariable=self.result_var, anchor="w", justify=tk.LEFT, wraplength=560)
+        self.result_label.pack(fill=tk.X)
+        self.log_text = tk.Text(self.result_frame, height=8, wrap=tk.NONE)
+        self.log_text.pack(fill=tk.BOTH, expand=True, pady=(6, 0))
+
+        buttons = ttk.Frame(body)
+        buttons.pack(fill=tk.X, pady=(12, 0))
+        self.install_button = ttk.Button(buttons, text="Install driver", command=lambda: self.app.install_driver(clean=False))
+        self.install_button.pack(side=tk.LEFT)
+        self.clean_button = ttk.Button(buttons, text="Clean reinstall", command=lambda: self.app.install_driver(clean=True))
+        self.clean_button.pack(side=tk.LEFT, padx=(8, 0))
+        self.check_button = ttk.Button(buttons, text="Check again", command=self.app.check_driver)
+        self.check_button.pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(buttons, text="Close", command=self._close).pack(side=tk.RIGHT)
+
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self._set_text(self.steps_text, "")
+
+    def _close(self) -> None:
+        self.app.driver_dialog = None
+        self.destroy()
+
+    @staticmethod
+    def _set_text(widget: tk.Text, text: str) -> None:
+        widget.configure(state=tk.NORMAL)
+        widget.delete("1.0", tk.END)
+        widget.insert("1.0", text)
+        widget.configure(state=tk.DISABLED)
+
+    def _copy_steps(self) -> None:
+        self.clipboard_clear()
+        self.clipboard_append(self.steps_text.get("1.0", tk.END).strip())
+
+    def set_busy(self, text: str) -> None:
+        self.headline_var.set(text)
+        self.headline.configure(fg="#444444")
+        for button in (self.install_button, self.clean_button, self.check_button):
+            button.configure(state=tk.DISABLED)
+
+    def show_summary(self, summary: maf_driver.DriverSummary) -> None:
+        self.summary = summary
+        if self.app._driver_installing:
+            return
+        self.headline_var.set(summary.headline)
+        self.headline.configure(fg=self.LEVEL_COLOURS.get(summary.level, "#000000"))
+        self.details_var.set("\n".join(summary.details))
+        steps = summary.steps or maf_driver.manual_steps(maf_driver.driver_root())
+        self._set_text(self.steps_text, "\n".join(f"{i}. {step}" for i, step in enumerate(steps, 1)))
+        self.install_button.configure(text=self.ACTION_LABELS.get(summary.action, "Install again"))
+        can_install = (maf_driver.driver_root() / maf_driver.PACKAGE_DIR).exists() and maf_driver.install_script().exists()
+        self.install_button.configure(state=tk.NORMAL if can_install else tk.DISABLED)
+        self.clean_button.configure(state=tk.NORMAL if can_install else tk.DISABLED)
+        self.check_button.configure(state=tk.NORMAL)
+
+    def show_install_result(self, level: str, message: str, log: str) -> None:
+        self.result_frame.pack(fill=tk.BOTH, expand=True, pady=(12, 0), before=self.install_button.master)
+        self.result_var.set(message)
+        self.result_label.configure(fg=self.LEVEL_COLOURS.get(level, "#000000"))
+        self._set_text(self.log_text, log or "(no log)")
+        if self.summary:
+            self.show_summary(self.summary)
 
 
 def main() -> None:

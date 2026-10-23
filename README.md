@@ -27,29 +27,52 @@ package includes `MAF.exe` for normal use.
 
 ## Install MAF Virtual Driver
 
-Open PowerShell as Administrator:
+Easiest: open MAF and click **Driver**. It checks whether the driver is installed, up to date
+and working, shows the manual steps, and installs or updates it (Windows asks for administrator
+permission). MAF opens this window by itself when the driver is missing.
+
+Manually, open PowerShell as Administrator:
 
 ```powershell
-Set-ExecutionPolicy -Scope Process Bypass
-cd C:\Windows\System32\multi_audio_fanout
-.\install_maf_driver.ps1
+cd E:\multi_audio_fanout_v2
+powershell -ExecutionPolicy Bypass -File .\install_maf_driver.ps1
 ```
 
-If the script enables Windows test-signing, reboot and run the same command
-again. If `bcdedit` reports that Secure Boot policy blocks the change, disable
-Secure Boot in BIOS/UEFI first, boot Windows, then rerun the installer.
+- If the driver is already installed, the script updates the existing MAF device in place
+  (it never adds a second one).
+- If it enables Windows test-signing, restart and run the same command again.
+- If Secure Boot is on, it stops and says so: turn off Secure Boot in the BIOS/UEFI setup,
+  start Windows, then run it again.
+- Exit codes: 0 done, 3010 restart needed, 4 blocked by Secure Boot, 1 failed.
 
-For a clean reinstall:
+Other options:
 
 ```powershell
-.\install_maf_driver.ps1 -Clean
+.\install_maf_driver.ps1 -Clean              # remove every MAF device and driver, then install
+.\install_maf_driver.ps1 -Status             # driver state as JSON, no admin needed
+.\install_maf_driver.ps1 -InstallPythonDeps  # also install Python packages for the .py scripts
 ```
 
-To also install Python packages for source-script usage:
+## Build the driver
+
+The driver is SysVAD's TabletAudioSample with MAF changes. Its loopback output (what MAF captures)
+is a real mixer: every playback stream, such as music, Windows alert sounds or calls, is added
+into one 48 kHz timeline, other sample rates are converted, and the loopback reads it 40 ms behind
+real time. Before this, streams were appended one after another, so any system sound mangled the
+music and added lag that never went away.
 
 ```powershell
-.\install_maf_driver.ps1 -InstallPythonDeps
+powershell -ExecutionPolicy Bypass -File .\build_driver.ps1
 ```
+
+- Needs Visual Studio 2022 Build Tools (C++ x64) and the WDK/SDK NuGet packages in `packages\`.
+  The full WDK is not needed.
+- Builds `TabletAudioSample.sys`, stamps a new DriverVer into the INF, makes the catalog and
+  signs both with the "MAF Test Driver Signing" certificate, all into `maf_sysvad_package\`.
+- The driver source changes are in `driver\sysvad_maf.patch` (against `Windows-driver-samples`)
+  plus `driver\Directory.Build.props/.targets` for `audio\sysvad`.
+- `driver\mixer_test\run_mixer_test.ps1` runs the mixer code in user mode with AddressSanitizer
+  (mixing, rate conversion, pause/resume, constant delay, fuzzing). Run it after changing the mixer.
 
 ## List Devices
 
