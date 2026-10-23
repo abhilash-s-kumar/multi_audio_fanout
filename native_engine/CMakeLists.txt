@@ -8,6 +8,7 @@ add_executable(maf_native_engine
 target_compile_features(maf_native_engine PRIVATE cxx_std_20)
 target_compile_definitions(maf_native_engine PRIVATE UNICODE _UNICODE NOMINMAX)
 target_link_libraries(maf_native_engine PRIVATE
+    advapi32
     avrt
     ole32
     uuid
