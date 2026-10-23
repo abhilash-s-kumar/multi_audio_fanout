@@ -23,7 +23,8 @@ SOFTWARE.
 ---------------------------------------------------------------------------------
 
 The MAF virtual audio driver (driver/, maf_sysvad_package/) is built from
-Microsoft's SysVAD sample in https://github.com/microsoft/Windows-driver-samples,
+Microsoft's SysVAD sample, and the devcon.exe in the release zip from Microsoft's
+devcon sample, both in https://github.com/microsoft/Windows-driver-samples and
 also under the MIT License:
 
 Copyright (c) Microsoft Corporation. All rights reserved.
