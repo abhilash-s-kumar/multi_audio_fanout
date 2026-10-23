@@ -51,6 +51,7 @@ MAX_OUTPUT_NAME_WIDTH = 64
 CHANNEL_MODES = ("Stereo", "Left", "Right")
 DEFAULT_CHANNEL_MODE = "Stereo"
 WINDOWS_VOLUME_POLL_MS = 150
+SPEAKER_VOLUME_POLL_MS = 250
 AUTO_RESET_DRAGGING_REPORTS = 3
 AUTO_RESET_COOLDOWN_SECONDS = 20.0
 RESET_RESTART_DELAY_MS = 700
@@ -184,6 +185,9 @@ class OutputControl:
     delay_ms: tk.DoubleVar
     channel_mode: tk.StringVar
     status: tk.StringVar
+    # The speaker's own volume; None when Windows does not expose it (then `volume` is shown instead).
+    speaker: SpeakerVolume | None = None
+    speaker_volume: tk.DoubleVar | None = None
 
 
 @dataclass
@@ -467,6 +471,96 @@ class WindowsMasterVolume:
             self.refresh()
         value = min(1.0, max(0.0, float(value)))
         self.endpoint.SetMasterVolumeLevelScalar(value, None)
+
+
+class SpeakerVolume:
+    """A playback device's own Windows volume.
+
+    For Bluetooth speakers with absolute volume (the usual case) this is the speaker's internal
+    volume: Windows and the speaker's buttons stay in step both ways.
+    """
+
+    def __init__(self, endpoint_id: str) -> None:
+        device = AudioUtilities.GetDeviceEnumerator().GetDevice(endpoint_id)
+        interface = device.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+        self.endpoint = interface.QueryInterface(IAudioEndpointVolume)
+        self.min_db, self.max_db, _step = self.endpoint.GetVolumeRange()
+        # ENDPOINT_HARDWARE_SUPPORT_VOLUME: the device itself changes volume (absolute volume).
+        self.in_device = bool(self.endpoint.QueryHardwareSupport() & 1)
+
+    def get(self) -> float:
+        return float(self.endpoint.GetMasterVolumeLevelScalar())
+
+    def set(self, value: float) -> None:
+        self.endpoint.SetMasterVolumeLevelScalar(min(1.0, max(0.0, float(value))), None)
+
+    def get_db(self) -> float:
+        return float(self.endpoint.GetMasterVolumeLevel())
+
+    def set_db(self, value: float) -> float:
+        value = min(self.max_db, max(self.min_db, float(value)))
+        self.endpoint.SetMasterVolumeLevel(value, None)
+        return value
+
+
+class LoudnessMatcher:
+    """Brings every speaker down to the quietest one's loudness at the mic, using the speakers' own volumes.
+
+    Speaker volume steps are not exact dB, so each pass measures how far a change actually moved
+    the loudness and corrects with that. Speakers are only turned down, never above where they started.
+    """
+
+    TOLERANCE_DB = 1.0
+    MAX_PASSES = 3
+
+    def __init__(self, levels: dict[str, float], volume_db: dict[str, float], ranges: dict[str, tuple[float, float]]) -> None:
+        self.reference = min(levels, key=levels.get)
+        self.levels = dict(levels)
+        self.start_db = dict(volume_db)
+        self.volume_db = dict(volume_db)
+        self.ranges = ranges
+        self.slope = {name: 1.0 for name in levels}
+        self.passes = 0
+        self._last_change: dict[str, tuple[float, float]] = {}  # name -> (volume dB change, level before)
+
+    def gap(self, name: str) -> float:
+        return self.levels[name] - self.levels[self.reference]
+
+    def worst_gap(self) -> float:
+        return max(abs(self.gap(name)) for name in self.levels)
+
+    def plan(self) -> dict[str, float]:
+        """Speaker volumes (dB) to set next; empty when matched or out of passes."""
+        if self.passes >= self.MAX_PASSES:
+            return {}
+        changes: dict[str, float] = {}
+        for name in self.levels:
+            gap = self.gap(name)
+            if name == self.reference or abs(gap) <= self.TOLERANCE_DB:
+                continue
+            low, _high = self.ranges[name]
+            target = self.volume_db[name] - (gap / self.slope[name])
+            target = min(self.start_db[name], max(low, target))
+            if abs(target - self.volume_db[name]) >= 0.1:
+                changes[name] = target
+        if changes:
+            self.passes += 1
+        self._last_change = {}
+        return changes
+
+    def applied(self, name: str, volume_db: float) -> None:
+        """Records the volume the speaker actually took (it may round to its own steps)."""
+        self._last_change[name] = (volume_db - self.volume_db[name], self.levels[name])
+        self.volume_db[name] = volume_db
+
+    def measured(self, levels: dict[str, float]) -> None:
+        for name, (change, before) in self._last_change.items():
+            if name in levels and abs(change) >= 0.5:
+                ratio = (levels[name] - before) / change
+                if 0.2 <= ratio <= 4.0:
+                    self.slope[name] = ratio
+        self.levels.update({name: value for name, value in levels.items() if name in self.levels})
+        self._last_change = {}
 
 
 class PlaybackWorker(threading.Thread):
@@ -800,6 +894,9 @@ class NativeFanoutSession(threading.Thread):
     def mic_check(self) -> None:
         self._send_control("miccheck")
 
+    def measure_levels(self) -> None:
+        self._send_control("levels")
+
     @staticmethod
     def _device_status_text(fields: dict[str, str]) -> str:
         state = fields.get("state", "?")
@@ -967,6 +1064,7 @@ class MAFApp(tk.Tk):
         self.windows_volume: WindowsMasterVolume | None = None
         self.follow_windows_volume = tk.BooleanVar(value=True)
         self._syncing_windows_volume = False
+        self._syncing_speaker_volume = False
         self._last_windows_volume: float | None = None
         self.status_var = tk.StringVar(value="Idle")
         self.status_queue: queue.Queue[object] = queue.Queue()
@@ -979,6 +1077,11 @@ class MAFApp(tk.Tk):
         self._last_auto_reset = 0.0
         self._native_restarts: deque[float] = deque()
         self._calibration_report: list[str] = []
+        self._calibration_mode = ""
+        self._calibration_levels: dict[str, float] = {}
+        self._loudness: LoudnessMatcher | None = None
+        self._loudness_start_volume: dict[str, float] = {}
+        self._loudness_result = (messagebox.showinfo, "")
         self._name_resize_start_x = 0
         self._name_resize_start_width = self.output_name_width
         self.driver_button_text = tk.StringVar(value="Driver")
@@ -995,6 +1098,7 @@ class MAFApp(tk.Tk):
         self._init_windows_volume()
         self.refresh_devices()
         self.after(WINDOWS_VOLUME_POLL_MS, self._poll_windows_volume)
+        self.after(SPEAKER_VOLUME_POLL_MS, self._poll_speaker_volumes)
         self.after(200, self._poll_status)
         self.after(VISUALIZER_REFRESH_MS, self._draw_visualizer)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -1259,7 +1363,7 @@ class MAFApp(tk.Tk):
         label = tk.StringVar()
 
         def update(*_args: object) -> None:
-            label.set(f"{int(variable.get() * 100)}%")
+            label.set(f"{round(variable.get() * 100)}%")
 
         variable.trace_add("write", update)
         update()
@@ -1370,7 +1474,7 @@ class MAFApp(tk.Tk):
         outputs_header.grid(row=0, column=0, sticky="ew", padx=(0, 12), pady=(0, 4))
         outputs_header.bind("<ButtonPress-1>", self._begin_name_resize)
         outputs_header.bind("<B1-Motion>", self._drag_name_resize)
-        ttk.Label(self.output_frame, text="Volume").grid(
+        ttk.Label(self.output_frame, text="Speaker volume").grid(
             row=0,
             column=1,
             columnspan=4,
@@ -1403,13 +1507,22 @@ class MAFApp(tk.Tk):
                 continue
 
             enabled = tk.BooleanVar(value=output.connected and self.settings.output_selected.get(output.name, False))
-            volume = tk.DoubleVar(value=self.settings.output_volume.get(output.name, 1.0))
+            speaker = self._open_speaker_volume(output)
+            # With the speaker's own volume available, MAF's digital volume for it stays at 100%:
+            # turning the speaker itself down keeps the full audio quality.
+            volume = tk.DoubleVar(value=1.0 if speaker else self.settings.output_volume.get(output.name, 1.0))
             delay_ms = tk.DoubleVar(value=self.settings.output_delay_ms.get(output.name, 0.0))
             channel_mode = tk.StringVar(value=self.settings.output_channel_mode.get(output.name, DEFAULT_CHANNEL_MODE))
             status = tk.StringVar(value="idle" if output.connected else "offline")
             control = OutputControl(output, enabled, volume, delay_ms, channel_mode, status)
+            if speaker:
+                control.speaker = speaker
+                control.speaker_volume = tk.DoubleVar(value=round(speaker.get(), 4))
+                self._bind_speaker_volume(control)
             self.controls.append(control)
             self._bind_output_settings(control)
+            shown_volume = control.speaker_volume or volume
+            volume_max = 1.0 if control.speaker_volume else 1.5
 
             ttk.Checkbutton(
                 self.output_frame,
@@ -1426,14 +1539,14 @@ class MAFApp(tk.Tk):
                 self.output_frame,
                 text="-",
                 width=3,
-                command=lambda variable=volume: self._nudge(variable, -VOLUME_STEP, 0.0, 1.5),
+                command=lambda variable=shown_volume, top=volume_max: self._nudge(variable, -VOLUME_STEP, 0.0, top),
                 state=tk.NORMAL if output.connected else tk.DISABLED,
             ).grid(row=row, column=1, sticky="e", padx=(4, 2), pady=7)
             ttk.Scale(
                 self.output_frame,
                 from_=0.0,
-                to=1.5,
-                variable=volume,
+                to=volume_max,
+                variable=shown_volume,
                 orient=tk.HORIZONTAL,
                 length=145,
                 state=tk.NORMAL if output.connected else tk.DISABLED,
@@ -1442,10 +1555,10 @@ class MAFApp(tk.Tk):
                 self.output_frame,
                 text="+",
                 width=3,
-                command=lambda variable=volume: self._nudge(variable, VOLUME_STEP, 0.0, 1.5),
+                command=lambda variable=shown_volume, top=volume_max: self._nudge(variable, VOLUME_STEP, 0.0, top),
                 state=tk.NORMAL if output.connected else tk.DISABLED,
             ).grid(row=row, column=3, sticky="w", padx=(2, 8), pady=7)
-            ttk.Label(self.output_frame, textvariable=self._volume_label(volume), width=5).grid(
+            ttk.Label(self.output_frame, textvariable=self._volume_label(shown_volume), width=5).grid(
                 row=row,
                 column=4,
                 sticky="w",
@@ -1511,6 +1624,46 @@ class MAFApp(tk.Tk):
         self.output_frame.columnconfigure(6, weight=0)
         self.output_frame.columnconfigure(9, weight=0)
         self.output_frame.columnconfigure(10, weight=1)
+
+    def _open_speaker_volume(self, output: OutputItem) -> SpeakerVolume | None:
+        endpoint_id = getattr(output.device, "id", None) if output.connected else None
+        if not endpoint_id:
+            return None
+        try:
+            return SpeakerVolume(str(endpoint_id))
+        except Exception:
+            return None
+
+    def _bind_speaker_volume(self, control: OutputControl) -> None:
+        def update(*_args: object) -> None:
+            if self._syncing_speaker_volume or control.speaker is None:
+                return
+            try:
+                control.speaker.set(control.speaker_volume.get())
+            except Exception:
+                control.speaker = None
+
+        control.speaker_volume.trace_add("write", update)
+
+    def _poll_speaker_volumes(self) -> None:
+        # Follows the speakers' own buttons (and any other app) changing their volume.
+        try:
+            for control in self.controls:
+                if control.speaker is None or control.speaker_volume is None:
+                    continue
+                try:
+                    value = control.speaker.get()
+                except Exception:
+                    control.speaker = None
+                    continue
+                if abs(value - control.speaker_volume.get()) > 0.004:
+                    self._syncing_speaker_volume = True
+                    try:
+                        control.speaker_volume.set(round(value, 4))
+                    finally:
+                        self._syncing_speaker_volume = False
+        finally:
+            self.after(SPEAKER_VOLUME_POLL_MS, self._poll_speaker_volumes)
 
     def _bind_output_settings(self, control: OutputControl) -> None:
         def update_volume(*_args: object) -> None:
@@ -1657,7 +1810,8 @@ class MAFApp(tk.Tk):
         if not messagebox.askokcancel(
             APP_NAME,
             "Calibration mutes the music for about 12 seconds and plays a short sweep on each speaker, "
-            "three times.\n\nPut the laptop where you usually listen, keep the room quiet, then press OK.",
+            "three times. Then it evens out the speakers' loudness by turning the louder ones down "
+            "(a few more short sweeps).\n\nPut the laptop where you usually listen, keep the room quiet, then press OK.",
         ):
             return
         self.session.calibrate()
@@ -1667,26 +1821,42 @@ class MAFApp(tk.Tk):
         name = str(event.get("name", ""))
         detail = str(event.get("detail", ""))
         if kind == "start":
-            self._calibration_report = []
+            self._calibration_mode = str(event.get("mode", ""))
+            self._calibration_levels = {}
             self._set_calibration_buttons(False)
-            if event.get("mode") == "calibrate":
+            if self._calibration_mode == "levels":
+                self.status_var.set("Matching loudness: measuring...")
+                return
+            self._calibration_report = []
+            self._loudness = None
+            if self._calibration_mode == "calibrate":
                 self._log("Calibration started")
                 self.status_var.set("Calibrating: checking the microphone...")
             else:
                 self._log("Microphone test started")
                 self.status_var.set("Testing the microphone...")
         elif kind == "mic":
-            raw = " (unprocessed)" if event.get("raw") else ""
-            self._log(f"Microphone: {name}{raw}")
+            if self._calibration_mode != "levels":
+                raw = " (unprocessed)" if event.get("raw") else ""
+                self._log(f"Microphone: {name}{raw}")
         elif kind == "warning":
-            self._calibration_report.append(f"Warning: {detail}")
+            if self._calibration_mode != "levels":
+                self._calibration_report.append(f"Warning: {detail}")
             self._log(f"Microphone warning: {detail}")
         elif kind == "mic_ok":
-            self._log(f"Microphone OK, level {event.get('level_dbfs', 0):.0f} dBFS")
+            if self._calibration_mode != "levels":
+                self._log(f"Microphone OK, level {event.get('level_dbfs', 0):.0f} dBFS")
         elif kind == "playing":
-            self.status_var.set("Calibrating: playing sweeps...")
+            if self._calibration_mode != "levels":
+                self.status_var.set("Calibrating: playing sweeps...")
         elif kind == "dev":
+            if "level_db" in event and event.get("level_reliable", True):
+                self._calibration_levels[name] = float(event["level_db"])
             status = event.get("status")
+            if self._calibration_mode == "levels":
+                if "level_db" in event:
+                    self._log(f"Loudness {name}: {float(event['level_db']):.1f} dB")
+                return
             if status == "ok":
                 line = f"{name}: {event.get('latency_ms', 0):.1f} ms (spread {event.get('spread_ms', 0):.1f} ms)"
             elif status == "unknown":
@@ -1702,21 +1872,134 @@ class MAFApp(tk.Tk):
                     break
             self._calibration_report.append(f"{name}: delay set to {event.get('ms', 0):.1f} ms")
         elif kind in ("done", "fail"):
-            self._set_calibration_buttons(isinstance(self.session, NativeFanoutSession) and self.session.is_alive())
             code = str(event.get("code", ""))
-            report = "\n".join(self._calibration_report)
-            message = detail + (f"\n\n{report}" if report else "")
             self._log(f"Calibration {kind}: {code} {detail}")
-            self.status_var.set(detail)
+            if self._calibration_mode == "levels":
+                self._on_loudness_measured(kind == "done" and code == "LEVELS", detail)
+                return
             if kind == "fail" and code == "STOPPED":
+                self._set_calibration_buttons(self._native_running())
+                self.status_var.set(detail)
                 return
             if kind == "fail":
                 title = "Microphone problem" if code.startswith("MIC_") else "Calibration failed"
-                messagebox.showwarning(title, message)
-            elif event.get("applied") or code == "MIC_OK":
-                messagebox.showinfo(APP_NAME, message)
+                self._show_calibration_result(messagebox.showwarning, title, detail)
+                return
+            show = messagebox.showinfo if event.get("applied") or code == "MIC_OK" else messagebox.showwarning
+            if self._calibration_mode == "calibrate" and self._start_loudness_match(show, detail):
+                return
+            self._show_calibration_result(show, APP_NAME, detail)
+
+    def _native_running(self) -> bool:
+        return isinstance(self.session, NativeFanoutSession) and self.session.is_alive()
+
+    def _show_calibration_result(self, show, title: str, detail: str) -> None:
+        self._set_calibration_buttons(self._native_running())
+        self.status_var.set(detail)
+        report = "\n".join(self._calibration_report)
+        show(title, detail + (f"\n\n{report}" if report else ""))
+
+    def _speaker_control(self, name: str) -> OutputControl | None:
+        return next((control for control in self.controls if control.item.name == name and control.speaker), None)
+
+    def _start_loudness_match(self, show, detail: str) -> bool:
+        """Starts evening out the speakers' loudness; False (with a note in the report) when it cannot."""
+        session_names = [control.item.name for control in self.session.controls] if self._native_running() else []
+        levels = {name: self._calibration_levels[name] for name in session_names if name in self._calibration_levels}
+        if len(session_names) < 2:
+            return False
+        if len(levels) < len(session_names):
+            self._calibration_report.append("Loudness: not every speaker was measured, so volumes were left alone.")
+            return False
+        missing = [name for name in levels if self._speaker_control(name) is None]
+        if missing:
+            self._calibration_report.append(f"Loudness: Windows does not expose the volume of {', '.join(missing)}.")
+            return False
+        speakers = {name: self._speaker_control(name).speaker for name in levels}
+        try:
+            matcher = LoudnessMatcher(
+                levels,
+                {name: speaker.get_db() for name, speaker in speakers.items()},
+                {name: (speaker.min_db, speaker.max_db) for name, speaker in speakers.items()},
+            )
+            start_volume = {name: speaker.get() for name, speaker in speakers.items()}
+        except Exception as exc:
+            self._calibration_report.append(f"Loudness: could not read the speaker volumes ({exc}).")
+            return False
+        if matcher.worst_gap() <= LoudnessMatcher.TOLERANCE_DB:
+            self._calibration_report.append(f"Loudness: already even (within {matcher.worst_gap():.1f} dB).")
+            return False
+        self._loudness = matcher
+        self._loudness_start_volume = start_volume
+        self._loudness_result = (show, detail)
+        self._log(f"Matching loudness to {matcher.reference}: " + ", ".join(
+            f"{name} {matcher.gap(name):+.1f} dB" for name in levels if name != matcher.reference))
+        self._apply_loudness_plan()
+        return True
+
+    def _apply_loudness_plan(self) -> None:
+        matcher = self._loudness
+        changes = matcher.plan() if matcher else {}
+        if not changes:
+            self._finish_loudness_match()
+            return
+        for name, target_db in changes.items():
+            control = self._speaker_control(name)
+            if control is None:
+                continue
+            try:
+                control.speaker.set_db(target_db)
+                matcher.applied(name, control.speaker.get_db())
+            except Exception as exc:
+                self._log(f"Could not set the volume of {name}: {exc}")
+        self.status_var.set("Matching loudness: checking...")
+        # Let the speakers take the new volume before measuring again.
+        self.after(800, self._measure_loudness)
+
+    def _measure_loudness(self) -> None:
+        if self._loudness and self._native_running():
+            self.session.measure_levels()
+        elif self._loudness:
+            self._calibration_report.append("Loudness: MAF stopped before the check finished.")
+            self._finish_loudness_match()
+
+    def _on_loudness_measured(self, ok: bool, detail: str) -> None:
+        matcher = self._loudness
+        if matcher is None:
+            self._set_calibration_buttons(self._native_running())
+            return
+        if not ok:
+            self._calibration_report.append(f"Loudness: the check did not finish ({detail})")
+            self._finish_loudness_match()
+            return
+        matcher.measured(self._calibration_levels)
+        if matcher.worst_gap() <= LoudnessMatcher.TOLERANCE_DB:
+            self._finish_loudness_match()
+            return
+        self._apply_loudness_plan()
+
+    def _finish_loudness_match(self) -> None:
+        matcher = self._loudness
+        self._loudness = None
+        if matcher is not None:
+            for name, before in self._loudness_start_volume.items():
+                control = self._speaker_control(name)
+                try:
+                    now = control.speaker.get() if control else before
+                except Exception:
+                    now = before
+                if abs(now - before) >= 0.005:
+                    self._calibration_report.append(f"{name}: speaker volume {before:.0%} -> {now:.0%}")
+            gap = matcher.worst_gap()
+            if gap <= LoudnessMatcher.TOLERANCE_DB:
+                self._calibration_report.append(f"Loudness matched (within {gap:.1f} dB).")
             else:
-                messagebox.showwarning(APP_NAME, message)
+                self._calibration_report.append(
+                    f"Loudness: still {gap:.1f} dB apart; the speakers' volume steps may be too coarse, "
+                    "or the quieter one is too far away.")
+            self._log(self._calibration_report[-1])
+        show, detail = self._loudness_result
+        self._show_calibration_result(show, APP_NAME, detail)
 
     def resync(self) -> None:
         # Native engine: realign every output in place, without reopening the speakers.

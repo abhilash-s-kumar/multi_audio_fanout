@@ -95,9 +95,12 @@ python .\maf_gui.py
 The GUI scans active playback devices, lets you select exactly which outputs
 receive MAF audio, and provides:
 
-- master volume
-- per-output volume
+- master volume (follows the Windows volume of the MAF output)
+- each speaker's own volume: for Bluetooth speakers with absolute volume this is the speaker's
+  internal volume, so the slider moves when you press the speaker's buttons and the other way round
 - per-output delay in milliseconds
+- Calibrate: measures each speaker's delay with the laptop mic, then evens out their loudness at
+  the mic by turning the louder speakers down (re-checked with short sweeps until within 1 dB)
 
 For sync correction, delay the devices that are playing early. A device that is
 already trailing cannot be made earlier in software; the other devices must be

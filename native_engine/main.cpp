@@ -63,7 +63,7 @@ std::atomic<float> g_master_gain = 1.0f;
 std::atomic<double> g_latency_ms = kDefaultLatencyMs;
 std::atomic<bool> g_sync_enabled = true;
 std::atomic<bool> g_calibration_active = false; // Outputs play calibration sweeps at fixed level.
-std::atomic<int> g_calibration_request = 0;     // 1 = calibrate, 2 = mic check only.
+std::atomic<int> g_calibration_request = 0;     // 1 = calibrate, 2 = mic check only, 3 = loudness only.
 std::wstring g_source_id;    // Written once before output threads start.
 std::wstring g_mic_selector; // Written once at startup; empty picks the default microphone.
 
@@ -399,7 +399,7 @@ void print_usage() {
         L"  maf_native_engine --source \"MAF Virtual Audio Output\" --out \"Motion Boom|left|1.0|0\" --out \"X600|right|1.0|35\"\n\n"
         L"                  [--mic <name-or-id>] [--calibrate]\n\n"
         L"stdin commands: master <g> | gain <i> <g> | mode <i> <stereo|left|right> | delay <i> <ms> |\n"
-        L"                latency <ms> | sync <0|1> | resync | calibrate | miccheck | quit"
+        L"                latency <ms> | sync <0|1> | resync | calibrate | miccheck | levels | quit"
     );
 }
 
@@ -1327,6 +1327,8 @@ constexpr double kCalChirpStartHz = 300.0;
 constexpr double kCalChirpEndHz = 6000.0;
 constexpr float kCalChirpLevel = 0.25f;
 constexpr int kCalRounds = 3;
+constexpr int kLevelRounds = 2;               // Loudness re-check after a speaker volume change.
+constexpr double kLevelTailSeconds = 0.05;    // Room echo counted in a sweep's loudness.
 constexpr double kCalMinSnr = 8.0;
 constexpr double kCalMaxSpreadMs = 5.0;
 constexpr double kCalTimeoutSeconds = 40.0;
@@ -2063,10 +2065,10 @@ struct CalEvent {
 // silence, then one sweep per speaker per round, paced by the PC clock.
 class CalibrationSignal {
 public:
-    void prepare(size_t output_count, UINT32 rate) {
+    void prepare(size_t output_count, UINT32 rate, int rounds) {
         std::lock_guard<std::mutex> lock(mutex_);
         chirp_ = make_chirp(rate);
-        events_ = std::vector<CalEvent>(output_count * kCalRounds);
+        events_ = std::vector<CalEvent>(output_count * static_cast<size_t>(rounds));
         for (size_t i = 0; i < events_.size(); ++i) {
             events_[i].output = i % output_count;
             events_[i].offset_frames = static_cast<UINT64>(static_cast<double>(i) * kCalSlotSeconds * rate);
@@ -2175,6 +2177,7 @@ struct SweepResult {
     double latency = 0.0;
     double snr = 0.0;
     double rise_db = -200.0;
+    double level_db = -200.0; // Sweep loudness at the mic above room noise, dBFS.
 };
 
 SweepResult analyze_sweep(const MicRecorder& mic, double offset, double slope, const std::vector<float>& templ,
@@ -2211,6 +2214,19 @@ SweepResult analyze_sweep(const MicRecorder& mic, double offset, double slope, c
     result.snr = noise > 0.0 ? std::abs(correlation[peak]) / noise : 0.0;
     result.latency = offset + (slope * static_cast<double>(first + static_cast<long long>(peak))) - play_time;
     result.heard = result.snr >= kCalMinSnr && result.latency > -0.02;
+
+    // Loudness: power of the sweep as it arrived (plus a short echo tail) minus the room noise.
+    // The sweep covers 300 Hz to 6 kHz with equal energy per octave, so bass differences between
+    // speakers count little, much like hearing.
+    const size_t arrival = static_cast<size_t>(first) + peak;
+    const size_t end = std::min(samples.size(), arrival + templ.size() + static_cast<size_t>(kLevelTailSeconds * kMicRate));
+    if (result.heard && end > arrival) {
+        const double rms = mic.rms(arrival, end);
+        const double power = (rms * rms) - (baseline_rms * baseline_rms);
+        if (power > 0.0) {
+            result.level_db = 10.0 * std::log10(power);
+        }
+    }
     return result;
 }
 
@@ -2218,8 +2234,12 @@ void calibration_failed(const std::wstring& code, const std::wstring& detail) {
     CalReport("fail").text("code", code).text("detail", detail).emit();
 }
 
-void run_calibration_steps(OutputList& outputs, UINT32 source_rate, bool full) {
-    CalReport("start").text("mode", full ? L"calibrate" : L"miccheck").emit();
+enum class CalMode { Calibrate = 1, MicCheck = 2, Levels = 3 };
+
+void run_calibration_steps(OutputList& outputs, UINT32 source_rate, CalMode mode) {
+    const bool full = mode != CalMode::MicCheck;
+    const bool levels_only = mode == CalMode::Levels;
+    CalReport("start").text("mode", mode == CalMode::Calibrate ? L"calibrate" : (levels_only ? L"levels" : L"miccheck")).emit();
     MicRecorder mic;
     std::wstring code;
     std::wstring detail;
@@ -2243,7 +2263,7 @@ void run_calibration_steps(OutputList& outputs, UINT32 source_rate, bool full) {
     };
 
     if (full) {
-        g_cal_signal.prepare(outputs.size(), source_rate);
+        g_cal_signal.prepare(outputs.size(), source_rate, levels_only ? kLevelRounds : kCalRounds);
         g_cal_signal.activate();
     }
     if (!record_for(full ? kCalPreSilenceSeconds : 0.3)) {
@@ -2302,6 +2322,8 @@ void run_calibration_steps(OutputList& outputs, UINT32 source_rate, bool full) {
         calibration_failed(after.code, L"During the sweeps: " + after.detail);
         return;
     }
+    // A clipping mic still times the sweeps correctly, but their loudness is unreliable.
+    const bool levels_reliable = after.ok;
     double offset = 0.0;
     double slope = 0.0;
     bool device_times = false;
@@ -2312,6 +2334,7 @@ void run_calibration_steps(OutputList& outputs, UINT32 source_rate, bool full) {
 
     struct OutputResult {
         std::vector<double> latencies;
+        std::vector<double> levels;
         double best_snr = 0.0;
         int sweeps = 0;
         bool playing = false;
@@ -2332,6 +2355,9 @@ void run_calibration_steps(OutputList& outputs, UINT32 source_rate, bool full) {
         result.best_snr = std::max(result.best_snr, sweep.snr);
         if (sweep.heard) {
             result.latencies.push_back(sweep.latency);
+            if (sweep.level_db > -150.0) {
+                result.levels.push_back(sweep.level_db);
+            }
             any_heard = true;
         }
     }
@@ -2364,6 +2390,13 @@ void run_calibration_steps(OutputList& outputs, UINT32 source_rate, bool full) {
             .integer("heard", static_cast<long long>(result.latencies.size()))
             .integer("sweeps", result.sweeps)
             .number("snr", result.best_snr);
+        if (!result.levels.empty()) {
+            double sum = 0.0;
+            for (const double level : result.levels) {
+                sum += level;
+            }
+            report.number("level_db", sum / static_cast<double>(result.levels.size())).flag("level_reliable", levels_reliable);
+        }
         if (result.latencies.empty()) {
             all_ok = false;
             if (result.playing) {
@@ -2378,7 +2411,9 @@ void run_calibration_steps(OutputList& outputs, UINT32 source_rate, bool full) {
             const double median = result.latencies[result.latencies.size() / 2];
             const double spread_ms = (result.latencies.back() - result.latencies.front()) * 1000.0;
             report.number("latency_ms", median * 1000.0).number("spread_ms", spread_ms);
-            if (result.latencies.size() >= 2 && spread_ms <= kCalMaxSpreadMs) {
+            if (levels_only) {
+                report.text("status", L"ok");
+            } else if (result.latencies.size() >= 2 && spread_ms <= kCalMaxSpreadMs) {
                 report.text("status", L"ok");
                 inherent[i] = median;
             } else {
@@ -2389,6 +2424,11 @@ void run_calibration_steps(OutputList& outputs, UINT32 source_rate, bool full) {
             }
         }
         report.emit();
+    }
+    if (levels_only) {
+        CalReport("done").flag("applied", false).text("code", all_ok ? L"LEVELS" : L"LEVELS_INCOMPLETE")
+            .text("detail", all_ok ? L"Loudness measured." : L"Not every speaker was heard.").emit();
+        return;
     }
     if (!all_ok) {
         CalReport("done").flag("applied", false).text("code", L"INCOMPLETE")
@@ -2439,12 +2479,13 @@ int run_selftest() {
             play_times.push_back(play);
             const double arrival = play + latencies[speaker];
             const size_t at = static_cast<size_t>((arrival - start) * kMicRate);
+            const float amplitude = speaker == 0 ? 0.02f : 0.01f; // The second speaker is 6 dB quieter.
             for (size_t i = 0; i < chirp.size() && at + i < total; ++i) {
-                room[at + i] += 0.02f * chirp[i];
+                room[at + i] += amplitude * chirp[i];
                 // A wall reflection 7 ms later at half strength.
                 const size_t echo = at + i + static_cast<size_t>(0.007 * kMicRate);
                 if (echo < total) {
-                    room[echo] += 0.01f * chirp[i];
+                    room[echo] += 0.5f * amplitude * chirp[i];
                 }
             }
         }
@@ -2460,12 +2501,16 @@ int run_selftest() {
     bool device_times = false;
     expect(mic.time_line(0, offset, slope, device_times) && std::abs(slope * kMicRate - 1.0) < 1e-6, L"time line fits");
     const double baseline = mic.rms(static_cast<size_t>(1.0 * kMicRate), baseline_to);
+    double level_sums[2] = { 0.0, 0.0 };
     for (size_t e = 0; e < play_times.size(); ++e) {
         const SweepResult sweep = analyze_sweep(mic, offset, slope, chirp, play_times[e], baseline);
         const double error_ms = (sweep.latency - latencies[e % 2]) * 1000.0;
         expect(sweep.heard && std::abs(error_ms) < 0.1, L"sweep " + std::to_wstring(e) + L" heard, error " +
             format_number(error_ms, 3) + L" ms, snr " + format_number(sweep.snr, 1));
+        level_sums[e % 2] += sweep.level_db;
     }
+    const double level_gap = (level_sums[0] - level_sums[1]) / kCalRounds;
+    expect(std::abs(level_gap - 6.02) < 0.5, L"loudness gap measured as " + format_number(level_gap, 2) + L" dB (expected 6.02)");
 
     std::vector<float> deaf(total);
     for (auto& sample : deaf) {
@@ -2498,9 +2543,9 @@ int run_selftest() {
     return failures == 0 ? 0 : 5;
 }
 
-void run_calibration(OutputList* outputs, UINT32 source_rate, bool full) {
+void run_calibration(OutputList* outputs, UINT32 source_rate, CalMode mode) {
     HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    run_calibration_steps(*outputs, source_rate, full);
+    run_calibration_steps(*outputs, source_rate, mode);
     g_cal_signal.deactivate();
     if (SUCCEEDED(co)) {
         CoUninitialize();
@@ -2553,6 +2598,8 @@ void run_control_stdin(OutputList* outputs, bool exit_on_eof) {
             g_calibration_request.store(1);
         } else if (command == "miccheck") {
             g_calibration_request.store(2);
+        } else if (command == "levels") {
+            g_calibration_request.store(3);
         } else if (command == "quit" || command == "stop") {
             g_stop_requested = true;
             break;
@@ -2802,7 +2849,7 @@ int run_engine(const Args& args) {
                 }
                 calibration_running = true;
                 calibration_thread = std::thread([outputs, source_rate, request, &calibration_running] {
-                    run_calibration(outputs, source_rate, request == 1);
+                    run_calibration(outputs, source_rate, static_cast<CalMode>(request));
                     calibration_running = false;
                 });
             }
