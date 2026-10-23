@@ -122,6 +122,37 @@ def compact_text(value: str, limit: int) -> str:
     return value[: max(0, limit - 3)] + "..."
 
 
+def draw_level_bar(
+    canvas: tk.Canvas, left: int, top: int, right: int, bottom: int, level: float,
+    track: str | None = None, outline: str = "", tick_colour: str | None = None,
+) -> None:
+    """dB-scaled level bar: green up to -12 dBFS, amber to -3 dBFS, red above."""
+    canvas.create_rectangle(left, top, right, bottom, fill=track or "", outline=outline)
+    fraction = meter_fraction(level)
+    span = right - left
+    for start_db, end_db, colour in ((METER_FLOOR_DB, -12.0, "#3a7"), (-12.0, -3.0, "#d9a400"), (-3.0, 0.0, "#d33")):
+        start = meter_fraction(10 ** (start_db / 20.0))
+        end = min(fraction, meter_fraction(10 ** (end_db / 20.0)))
+        if end > start:
+            canvas.create_rectangle(left + int(span * start), top, left + int(span * end), bottom, fill=colour, outline="")
+    if tick_colour:
+        for tick_db in (-40.0, -20.0, -6.0):
+            x = left + int(span * meter_fraction(10 ** (tick_db / 20.0)))
+            canvas.create_line(x, bottom, x, bottom + 3, fill=tick_colour)
+
+
+def virtual_screen() -> tuple[int, int, int, int]:
+    """Left, top, width and height of the desktop across all monitors."""
+    try:
+        metrics = ctypes.windll.user32.GetSystemMetrics
+        width, height = metrics(78), metrics(79)  # SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN
+        if width > 0 and height > 0:
+            return metrics(76), metrics(77), width, height  # SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN
+    except (AttributeError, OSError):
+        pass
+    return 0, 0, 1920, 1080
+
+
 @dataclass
 class SourceItem:
     index: int
@@ -255,6 +286,7 @@ class AudioSettings:
         self.output_name_width = DEFAULT_OUTPUT_NAME_WIDTH
         self.calibration_mic = ""  # Empty: the engine picks the default / built-in microphone.
         self.delay_floor_ms = 0.0
+        self.widget_position: tuple[int, int] | None = None
         self.output_volume: dict[str, float] = {}
         self.output_delay_ms: dict[str, float] = {}
         self.output_selected: dict[str, bool] = {}
@@ -278,6 +310,9 @@ class AudioSettings:
                 )
             if isinstance(data.get("calibration_mic"), str):
                 self.calibration_mic = data["calibration_mic"]
+            position = data.get("widget_position")
+            if isinstance(position, list) and len(position) == 2:
+                self.widget_position = (int(position[0]), int(position[1]))
             outputs = data.get("outputs", {})
             if not isinstance(outputs, dict):
                 return
@@ -312,6 +347,7 @@ class AudioSettings:
                     "auto_reset_enabled": self.auto_reset_enabled,
                     "output_name_width": self.output_name_width,
                     "calibration_mic": self.calibration_mic,
+                    "widget_position": list(self.widget_position) if self.widget_position else None,
                     "outputs": {
                         name: {
                             "volume": self.output_volume.get(name, 1.0),
@@ -387,6 +423,11 @@ class AudioSettings:
     def set_output_name_width(self, value: int) -> None:
         with self._lock:
             self.output_name_width = min(MAX_OUTPUT_NAME_WIDTH, max(MIN_OUTPUT_NAME_WIDTH, int(value)))
+            self._save()
+
+    def set_widget_position(self, x: int, y: int) -> None:
+        with self._lock:
+            self.widget_position = (int(x), int(y))
             self._save()
 
     def set_delay_floor_ms(self, value: float) -> None:
@@ -946,6 +987,7 @@ class MAFApp(tk.Tk):
         self._driver_checking = False
         self._driver_installing = False
         self._driver_first_check = True
+        self.mini_widget: MiniWidget | None = None
 
         self._build_ui()
         self._update_sync_button()
@@ -956,6 +998,9 @@ class MAFApp(tk.Tk):
         self.after(200, self._poll_status)
         self.after(VISUALIZER_REFRESH_MS, self._draw_visualizer)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        # The floating widget stands in for the window while it is minimised.
+        self.bind("<Unmap>", self._on_main_unmap)
+        self.bind("<Map>", self._on_main_map)
         self._log("MAF ready")
         self.after(500, self.check_driver)
 
@@ -1152,6 +1197,7 @@ class MAFApp(tk.Tk):
         ]
         if not active:
             canvas.create_text(width // 2, height // 2, text="No active outputs", fill="#666")
+            self._redraw_mini_widget()
             self.after(VISUALIZER_REFRESH_MS, self._draw_visualizer)
             return
 
@@ -1163,22 +1209,12 @@ class MAFApp(tk.Tk):
             top = index * row_height + 4
             center = top + row_height // 2
             name = compact_text(control.item.name, 18)
-            level = meter_fraction(self.output_levels.get(control.item.name, 0.0))
             canvas.create_text(4, center, text=name, anchor="w", fill="#333")
-            canvas.create_rectangle(bar_left, center - 5, bar_right, center + 5, outline="#aaa")
-            # Green up to -12 dBFS, amber to -3 dBFS, red above.
-            span = bar_right - bar_left
-            for start_db, end_db, colour in ((METER_FLOOR_DB, -12.0, "#3a7"), (-12.0, -3.0, "#d9a400"), (-3.0, 0.0, "#d33")):
-                start = meter_fraction(10 ** (start_db / 20.0))
-                end = min(level, meter_fraction(10 ** (end_db / 20.0)))
-                if end > start:
-                    canvas.create_rectangle(
-                        bar_left + int(span * start), center - 5, bar_left + int(span * end), center + 5,
-                        fill=colour, outline="",
-                    )
-            for tick_db in (-40.0, -20.0, -6.0):
-                x = bar_left + int(span * meter_fraction(10 ** (tick_db / 20.0)))
-                canvas.create_line(x, center + 5, x, center + 8, fill="#999")
+            draw_level_bar(
+                canvas, bar_left, center - 5, bar_right, center + 5,
+                self.output_levels.get(control.item.name, 0.0), outline="#aaa", tick_colour="#999",
+            )
+        self._redraw_mini_widget()
         for name in list(self.output_levels):
             self.output_levels[name] *= VISUALIZER_DECAY
             if self.output_levels[name] < 0.001:
@@ -1888,9 +1924,322 @@ class MAFApp(tk.Tk):
         self.check_driver()
         self.after(1500, self.refresh_devices)
 
+    def _on_main_unmap(self, event: tk.Event) -> None:
+        if event.widget is self:
+            # The state reads "iconic" only once the minimise has finished.
+            self.after_idle(self._show_mini_widget_if_minimised)
+
+    def _show_mini_widget_if_minimised(self) -> None:
+        if self.state() != "iconic":
+            return
+        if not (self.mini_widget and self.mini_widget.winfo_exists()):
+            self.mini_widget = MiniWidget(self)
+        self.mini_widget.show()
+
+    def _on_main_map(self, event: tk.Event) -> None:
+        if event.widget is self and self.mini_widget and self.mini_widget.winfo_exists():
+            self.mini_widget.hide()
+
+    def _redraw_mini_widget(self) -> None:
+        if self.mini_widget and self.mini_widget.winfo_exists() and self.mini_widget.winfo_viewable():
+            self.mini_widget.redraw()
+
+    def show_main_window(self) -> None:
+        self.deiconify()
+        self.lift()
+        self.focus_force()
+
+    def is_running(self) -> bool:
+        return bool(self.session and self.session.is_alive())
+
+    def toggle_running(self) -> None:
+        if self.is_running():
+            self.stop()
+            return
+        self.start()
+        if not self.is_running():
+            # start() refused (no outputs, bad source...): its message needs the window.
+            self.show_main_window()
+
     def _on_close(self) -> None:
         self.stop()
+        if self.mini_widget and self.mini_widget.winfo_exists():
+            self.mini_widget.destroy()
         self.destroy()
+
+
+def speaker_dot_colour(status: str, running: bool) -> str:
+    """Sync dot colour from an output's status text (first word is the engine state)."""
+    if not running:
+        return MiniWidget.DOT_IDLE
+    state = status.split()[0].casefold() if status.strip() else ""
+    if state in ("locked", "free", "leading"):
+        return MiniWidget.DOT_GOOD
+    if state in ("settling", "opening", "starting", "dragging", "idle"):
+        return MiniWidget.DOT_BUSY
+    return MiniWidget.DOT_BAD
+
+
+class MiniWidget(tk.Toplevel):
+    """Always-on-top strip shown while MAF is minimised: one dot per speaker, one level meter."""
+
+    WIDTH = 240
+    HEIGHT = 36
+    BACKGROUND = "#202327"
+    FOREGROUND = "#d8dadd"
+    BUTTON_HOVER = "#3a3f46"
+    TRACK = "#383d44"
+    DOT_GOOD = "#3fbf6f"
+    DOT_BUSY = "#e0a800"
+    DOT_BAD = "#e5534b"
+    DOT_IDLE = "#6b7178"
+    VOLUME_READOUT_MS = 1200
+
+    def __init__(self, app: MAFApp) -> None:
+        super().__init__(app)
+        self.app = app
+        self.withdraw()
+        self.overrideredirect(True)
+        self.attributes("-topmost", True)
+        try:
+            self.attributes("-alpha", 0.92)
+        except tk.TclError:
+            pass
+        self.configure(background=self.BACKGROUND)
+        self.canvas = tk.Canvas(
+            self, width=self.WIDTH, height=self.HEIGHT, background=self.BACKGROUND,
+            highlightthickness=1, highlightbackground="#444a52", borderwidth=0,
+        )
+        self.canvas.pack(fill=tk.BOTH, expand=True)
+        self._drag_offset: tuple[int, int] | None = None
+        self._dragged = False
+        self._volume_readout_until = 0.0
+        self._hover_button: str | None = None
+        self._tooltip: tk.Toplevel | None = None
+        self._tooltip_label: tk.Label | None = None
+        self._tooltip_job: str | None = None
+
+        self.menu = tk.Menu(self, tearoff=False)
+        self.menu.add_command(label="Open MAF", command=self.app.show_main_window)
+        self.menu.add_command(label="Resync", command=self.app.resync)
+        self.menu.add_separator()
+        self.menu.add_command(label="Test Mic", command=lambda: self._in_main_window(self.app.mic_check))
+        self.menu.add_command(label="Calibrate", command=lambda: self._in_main_window(self.app.calibrate))
+        self.menu.add_separator()
+        self.menu.add_command(label="Quit MAF", command=self.app._on_close)
+
+        self.canvas.bind("<ButtonPress-1>", self._on_press)
+        self.canvas.bind("<B1-Motion>", self._on_drag)
+        self.canvas.bind("<ButtonRelease-1>", self._on_release)
+        self.canvas.bind("<Double-Button-1>", lambda _event: self.app.show_main_window())
+        self.canvas.bind("<Button-3>", self._on_menu)
+        self.canvas.bind("<MouseWheel>", self._on_wheel)
+        self.canvas.bind("<Motion>", self._on_motion)
+        self.canvas.bind("<Enter>", self._on_enter)
+        self.canvas.bind("<Leave>", self._on_leave)
+        self._place()
+
+    # Layout -------------------------------------------------------------------------------
+
+    def _buttons(self) -> list[tuple[str, str, int, int, bool]]:
+        """(key, glyph, left, right, enabled) for the buttons at the right end."""
+        running = self.app.is_running()
+        native = isinstance(self.app.session, NativeFanoutSession) and running
+        right = self.WIDTH - 4
+        layout = []
+        for key, glyph, enabled in (
+            ("open", "⤢", True),
+            ("resync", "⟳", native),
+            ("toggle", "■" if running else "▶", True),
+        ):
+            layout.append((key, glyph, right - 26, right, enabled))
+            right -= 28
+        return layout
+
+    def _active_controls(self) -> list[OutputControl]:
+        return [control for control in self.app.controls if control.item.connected and control.enabled.get()]
+
+    def redraw(self) -> None:
+        canvas = self.canvas
+        canvas.delete("all")
+        middle = self.HEIGHT // 2
+        running = self.app.is_running()
+        controls = self._active_controls()
+
+        x = 12
+        for control in controls[:6]:
+            colour = speaker_dot_colour(control.status.get(), running)
+            canvas.create_oval(x - 5, middle - 5, x + 5, middle + 5, fill=colour, outline="")
+            x += 15
+
+        buttons = self._buttons()
+        meter_left = max(x + 2, 12)
+        meter_right = buttons[-1][2] - 8
+        if time.monotonic() < self._volume_readout_until:
+            volume = int(round(self.app.master_volume.get() * 100))
+            canvas.create_text((meter_left + meter_right) // 2, middle, text=f"Volume {volume}%", fill=self.FOREGROUND)
+        else:
+            level = max((self.app.output_levels.get(control.item.name, 0.0) for control in controls), default=0.0)
+            draw_level_bar(canvas, meter_left, middle - 4, meter_right, middle + 4, level, track=self.TRACK)
+
+        for key, glyph, left, right, enabled in buttons:
+            if enabled and key == self._hover_button:
+                canvas.create_rectangle(left, 5, right, self.HEIGHT - 5, fill=self.BUTTON_HOVER, outline="")
+            canvas.create_text(
+                (left + right) // 2, middle, text=glyph, font=("Segoe UI Symbol", 11),
+                fill=self.FOREGROUND if enabled else self.DOT_IDLE,
+            )
+        if self._tooltip_label is not None:
+            self._tooltip_label.configure(text=self._tooltip_text())
+
+    def _button_at(self, x: int, y: int) -> tuple[str, bool] | None:
+        for key, _glyph, left, right, enabled in self._buttons():
+            if left <= x <= right and 0 <= y <= self.HEIGHT:
+                return key, enabled
+        return None
+
+    # Showing and placing ------------------------------------------------------------------
+
+    def show(self) -> None:
+        self._place()
+        self.redraw()
+        self.deiconify()
+        self.attributes("-topmost", True)
+        self.lift()
+
+    def hide(self) -> None:
+        self._hide_tooltip()
+        self.menu.unpost()
+        self.withdraw()
+
+    def _place(self) -> None:
+        left, top, width, height = virtual_screen()
+        position = self.app.settings.widget_position
+        if position is None:
+            # Bottom right of the main screen, above the taskbar.
+            x = self.winfo_screenwidth() - self.WIDTH - 24
+            y = self.winfo_screenheight() - self.HEIGHT - 72
+        else:
+            x, y = position
+        x = min(max(x, left), left + width - self.WIDTH)
+        y = min(max(y, top), top + height - self.HEIGHT)
+        self.geometry(f"{self.WIDTH}x{self.HEIGHT}+{x}+{y}")
+
+    # Mouse --------------------------------------------------------------------------------
+
+    def _on_press(self, event: tk.Event) -> None:
+        self._hide_tooltip()
+        self._dragged = False
+        if self._button_at(event.x, event.y):
+            self._drag_offset = None
+            return
+        self._drag_offset = (event.x_root - self.winfo_x(), event.y_root - self.winfo_y())
+
+    def _on_drag(self, event: tk.Event) -> None:
+        if self._drag_offset is None:
+            return
+        self._dragged = True
+        x = event.x_root - self._drag_offset[0]
+        y = event.y_root - self._drag_offset[1]
+        self.geometry(f"+{x}+{y}")
+
+    def _on_release(self, event: tk.Event) -> None:
+        if self._drag_offset is not None:
+            if self._dragged:
+                self.app.settings.set_widget_position(self.winfo_x(), self.winfo_y())
+            self._drag_offset = None
+            return
+        hit = self._button_at(event.x, event.y)
+        if not hit or not hit[1]:
+            return
+        key = hit[0]
+        if key == "open":
+            self.app.show_main_window()
+        elif key == "resync":
+            self.app.resync()
+        elif key == "toggle":
+            self.app.toggle_running()
+        self.redraw()
+
+    def _on_motion(self, event: tk.Event) -> None:
+        hit = self._button_at(event.x, event.y)
+        hover = hit[0] if hit and hit[1] else None
+        if hover != self._hover_button:
+            self._hover_button = hover
+            self.redraw()
+
+    def _on_wheel(self, event: tk.Event) -> None:
+        step = VOLUME_STEP if event.delta > 0 else -VOLUME_STEP
+        self.app._nudge(self.app.master_volume, step, 0.0, 1.5)
+        self._volume_readout_until = time.monotonic() + self.VOLUME_READOUT_MS / 1000.0
+        self.redraw()
+
+    def _on_menu(self, event: tk.Event) -> None:
+        self._hide_tooltip()
+        native = isinstance(self.app.session, NativeFanoutSession) and self.app.is_running()
+        state = tk.NORMAL if native else tk.DISABLED
+        for label in ("Resync", "Test Mic", "Calibrate"):
+            self.menu.entryconfigure(label, state=state)
+        try:
+            self.menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.menu.grab_release()
+
+    def _in_main_window(self, action) -> None:
+        # Mic test and calibration open message boxes, which belong to the main window.
+        self.app.show_main_window()
+        self.app.after(150, action)
+
+    # Tooltip ------------------------------------------------------------------------------
+
+    def _tooltip_text(self) -> str:
+        running = self.app.is_running()
+        lines = [f"MAF  {self.app.status_var.get()}" if running else "MAF  stopped"]
+        for control in self._active_controls():
+            state = control.status.get() if running else "idle"
+            lines.append(f"{compact_text(control.item.name, 34)}:  {state}")
+        lines.append("Wheel: volume   Drag: move   Right-click: more")
+        return "\n".join(lines)
+
+    def _on_enter(self, _event: tk.Event) -> None:
+        if self._tooltip_job is None:
+            self._tooltip_job = self.after(500, self._show_tooltip)
+
+    def _on_leave(self, _event: tk.Event) -> None:
+        self._hover_button = None
+        self._hide_tooltip()
+        self.redraw()
+
+    def _show_tooltip(self) -> None:
+        self._tooltip_job = None
+        if self._drag_offset is not None or self._tooltip is not None:
+            return
+        tip = tk.Toplevel(self)
+        tip.overrideredirect(True)
+        tip.attributes("-topmost", True)
+        label = tk.Label(
+            tip, text=self._tooltip_text(), justify=tk.LEFT, background="#2b2f35", foreground=self.FOREGROUND,
+            padx=8, pady=6, borderwidth=1, relief=tk.SOLID,
+        )
+        label.pack()
+        tip.update_idletasks()
+        left, top, width, _height = virtual_screen()
+        x = min(max(self.winfo_x(), left), left + width - tip.winfo_reqwidth())
+        y = self.winfo_y() - tip.winfo_reqheight() - 6
+        if y < top:
+            y = self.winfo_y() + self.HEIGHT + 6
+        tip.geometry(f"+{x}+{y}")
+        self._tooltip = tip
+        self._tooltip_label = label
+
+    def _hide_tooltip(self) -> None:
+        if self._tooltip_job is not None:
+            self.after_cancel(self._tooltip_job)
+            self._tooltip_job = None
+        if self._tooltip is not None:
+            self._tooltip.destroy()
+        self._tooltip = None
+        self._tooltip_label = None
 
 
 class DriverDialog(tk.Toplevel):
