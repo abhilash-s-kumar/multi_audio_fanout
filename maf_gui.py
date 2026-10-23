@@ -53,6 +53,10 @@ WINDOWS_VOLUME_POLL_MS = 150
 AUTO_RESET_DRAGGING_REPORTS = 3
 AUTO_RESET_COOLDOWN_SECONDS = 20.0
 RESET_RESTART_DELAY_MS = 700
+NATIVE_LATENCY_MS = 100.0
+NATIVE_STOP_TIMEOUT_SECONDS = 2.0
+NATIVE_AUTO_RESTART_LIMIT = 3
+NATIVE_AUTO_RESTART_WINDOW_SECONDS = 60.0
 VISUALIZER_REFRESH_MS = 33
 VISUALIZER_DECAY = 0.94
 SETTINGS_PATH = Path(os.environ.get("APPDATA", str(Path.home()))) / "MAF" / "settings.json"
@@ -658,6 +662,8 @@ class NativeFanoutSession(threading.Thread):
         status_queue: queue.Queue[object],
         engine_path: Path,
         master_gain: float,
+        sync_enabled: bool,
+        latency_ms: float = NATIVE_LATENCY_MS,
     ) -> None:
         super().__init__(name="maf-native-engine", daemon=True)
         self.source = source
@@ -666,7 +672,10 @@ class NativeFanoutSession(threading.Thread):
         self.status_queue = status_queue
         self.engine_path = engine_path
         self.master_gain = max(0.0, float(master_gain))
+        self.sync_enabled = bool(sync_enabled)
+        self.latency_ms = float(latency_ms)
         self.process: subprocess.Popen[str] | None = None
+        self.unexpected_exit = False
         self._control_lock = threading.Lock()
         self._control_index = {control.item.name: index for index, control in enumerate(controls)}
 
@@ -690,13 +699,83 @@ class NativeFanoutSession(threading.Thread):
             return
         self._send_control(f"gain {index} {max(0.0, float(gain)):.4f}")
 
+    def set_output_delay(self, name: str, delay_ms: float) -> None:
+        index = self._control_index.get(name)
+        if index is None:
+            return
+        self._send_control(f"delay {index} {float(delay_ms):.1f}")
+
+    def set_output_channel_mode(self, name: str, mode: str) -> None:
+        index = self._control_index.get(name)
+        if index is None:
+            return
+        self._send_control(f"mode {index} {mode.lower()}")
+
+    def set_sync(self, enabled: bool) -> None:
+        self._send_control(f"sync {1 if enabled else 0}")
+
+    def resync(self) -> None:
+        self._send_control("resync")
+
+    @staticmethod
+    def _device_status_text(fields: dict[str, str]) -> str:
+        state = fields.get("state", "?")
+        text = state
+        if "err" in fields:
+            text += f" {fields['err']}ms {fields.get('ppm', '0')}ppm"
+        extras = [
+            f"{label}={fields[key]}"
+            for key, label in (("under", "under"), ("snaps", "snap"))
+            if fields.get(key, "0") != "0"
+        ]
+        if extras:
+            text += " " + " ".join(extras)
+        return text
+
     def _read_stdout(self) -> None:
         if not self.process or not self.process.stdout:
             return
         for line in self.process.stdout:
             text = line.strip()
-            if text:
-                self.status_queue.put(("status", text))
+            if not text:
+                continue
+            parts = text.split()
+            if parts[0] == "dev" and len(parts) >= 2 and parts[1].isdigit():
+                index = int(parts[1])
+                if index < len(self.controls):
+                    fields = dict(part.split("=", 1) for part in parts[2:] if "=" in part)
+                    self.status_queue.put((
+                        "device_status",
+                        self.controls[index].item.name,
+                        self._device_status_text(fields),
+                    ))
+                continue
+            if parts[0] == "src" and len(parts) >= 2 and parts[1].startswith("state="):
+                if parts[1] != "state=running":
+                    self.status_queue.put(("status_bar", "Waiting for the MAF source..."))
+                continue
+            self.status_queue.put(("status", text))
+
+    def _output_selector(self, control: OutputControl) -> str:
+        device_id = getattr(control.item.device, "id", None)
+        return str(device_id) if device_id else control.item.name
+
+    def _stop_process(self) -> None:
+        if not self.process or self.process.poll() is not None:
+            return
+        # Ask first so the engine stops its audio clients cleanly; Bluetooth recovers faster that way.
+        self._send_control("quit")
+        try:
+            self.process.wait(timeout=NATIVE_STOP_TIMEOUT_SECONDS)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        self.process.terminate()
+        try:
+            self.process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+            self.process.wait(timeout=2)
 
     def run(self) -> None:
         if not self.engine_path.exists():
@@ -705,11 +784,23 @@ class NativeFanoutSession(threading.Thread):
             return
 
         source_selector = MAF_ENDPOINT_MARKER if is_maf_endpoint(self.source.name) else self.source.name
-        args = [str(self.engine_path), "--source", source_selector, "--master", f"{self.master_gain:.4f}"]
+        args = [
+            str(self.engine_path),
+            "--source",
+            source_selector,
+            "--master",
+            f"{self.master_gain:.4f}",
+            "--latency-ms",
+            f"{self.latency_ms:.0f}",
+            "--exit-on-stdin-eof",
+        ]
+        if not self.sync_enabled:
+            args.append("--no-sync")
         for control in self.controls:
             mode = control.channel_mode.get().lower()
             gain = max(0.0, float(control.volume.get()))
-            args.extend(["--out", f"{control.item.name}:{mode}:{gain:.4f}"])
+            delay_ms = float(control.delay_ms.get())
+            args.extend(["--out", f"{self._output_selector(control)}|{mode}|{gain:.4f}|{delay_ms:.1f}"])
 
         creation_flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         try:
@@ -729,7 +820,7 @@ class NativeFanoutSession(threading.Thread):
                 "Running native engine: " + ", ".join(control.item.name for control in self.controls),
             ))
             for control in self.controls:
-                self.status_queue.put(("device_status", control.item.name, "native"))
+                self.status_queue.put(("device_status", control.item.name, "starting"))
 
             reader = threading.Thread(target=self._read_stdout, name="maf-native-stdout", daemon=True)
             reader.start()
@@ -738,16 +829,11 @@ class NativeFanoutSession(threading.Thread):
                     break
                 time.sleep(0.05)
 
-            if self.stop_event.is_set() and self.process.poll() is None:
-                self.process.terminate()
-                try:
-                    self.process.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    self.process.kill()
-                    self.process.wait(timeout=2)
-
-            return_code = self.process.returncode if self.process else 0
-            if return_code not in (0, None) and not self.stop_event.is_set():
+            if self.stop_event.is_set():
+                self._stop_process()
+            else:
+                self.unexpected_exit = True
+                return_code = self.process.returncode
                 self.status_queue.put(("status", f"Error: native engine exited with code {return_code}"))
         except BaseException as exc:
             self.status_queue.put(("status", f"Error: native engine failed: {exc}"))
@@ -785,6 +871,7 @@ class MAFApp(tk.Tk):
         self._restart_scheduled = False
         self._dragging_reports: dict[str, int] = {}
         self._last_auto_reset = 0.0
+        self._native_restarts: deque[float] = deque()
         self._name_resize_start_x = 0
         self._name_resize_start_width = self.output_name_width
 
@@ -898,6 +985,8 @@ class MAFApp(tk.Tk):
         self.stop_button.pack(side=tk.LEFT, padx=(8, 0))
         self.reset_button = ttk.Button(bottom, text="Reset", command=self.reset, state=tk.DISABLED)
         self.reset_button.pack(side=tk.LEFT, padx=(8, 0))
+        self.resync_button = ttk.Button(bottom, text="Resync", command=self.resync, state=tk.DISABLED)
+        self.resync_button.pack(side=tk.LEFT, padx=(8, 0))
         self.sync_button = ttk.Button(bottom, textvariable=self.sync_button_text, command=self._toggle_sync)
         self.sync_button.pack(side=tk.LEFT, padx=(8, 0))
         ttk.Checkbutton(
@@ -934,10 +1023,20 @@ class MAFApp(tk.Tk):
         if isinstance(self.session, NativeFanoutSession) and self.session.is_alive():
             self.session.set_output_gain(control.item.name, control.volume.get())
 
+    def _send_native_output_delay(self, control: OutputControl) -> None:
+        if isinstance(self.session, NativeFanoutSession) and self.session.is_alive():
+            self.session.set_output_delay(control.item.name, control.delay_ms.get())
+
+    def _send_native_channel_mode(self, control: OutputControl) -> None:
+        if isinstance(self.session, NativeFanoutSession) and self.session.is_alive():
+            self.session.set_output_channel_mode(control.item.name, control.channel_mode.get())
+
     def _toggle_sync(self) -> None:
         self.sync_enabled.set(not self.sync_enabled.get())
         self.settings.set_sync_enabled(self.sync_enabled.get())
         self._update_sync_button()
+        if isinstance(self.session, NativeFanoutSession) and self.session.is_alive():
+            self.session.set_sync(self.sync_enabled.get())
         self._log(f"Sync {'enabled' if self.sync_enabled.get() else 'disabled'}")
 
     def _toggle_auto_reset(self) -> None:
@@ -1288,9 +1387,11 @@ class MAFApp(tk.Tk):
         def update_delay(*_args: object) -> None:
             self.settings.set_output_delay_ms(control.item.name, control.delay_ms.get())
             self._sync_delay_floor()
+            self._send_native_output_delay(control)
 
         def update_channel(*_args: object) -> None:
             self.settings.set_output_channel_mode(control.item.name, control.channel_mode.get())
+            self._send_native_channel_mode(control)
 
         control.volume.trace_add("write", update_volume)
         control.delay_ms.trace_add("write", update_delay)
@@ -1373,6 +1474,7 @@ class MAFApp(tk.Tk):
                 status_queue=self.status_queue,
                 engine_path=engine_path,
                 master_gain=self.master_volume.get(),
+                sync_enabled=self.sync_enabled.get(),
             )
             self._log(f"Using native engine: {engine_path}")
         else:
@@ -1388,6 +1490,7 @@ class MAFApp(tk.Tk):
         self.start_button.configure(state=tk.DISABLED)
         self.stop_button.configure(state=tk.NORMAL)
         self.reset_button.configure(state=tk.NORMAL)
+        self.resync_button.configure(state=tk.NORMAL)
         self.status_var.set("Starting...")
         self.output_levels = {control.item.name: 0.0 for control in selected}
         self._log("Started fanout: " + ", ".join(control.item.name for control in selected))
@@ -1399,8 +1502,17 @@ class MAFApp(tk.Tk):
         self.start_button.configure(state=tk.NORMAL)
         self.stop_button.configure(state=tk.DISABLED)
         self.reset_button.configure(state=tk.DISABLED)
+        self.resync_button.configure(state=tk.DISABLED)
         self.status_var.set(status)
         self._log(status)
+
+    def resync(self) -> None:
+        # Native engine: realign every output in place, without reopening the speakers.
+        if isinstance(self.session, NativeFanoutSession) and self.session.is_alive():
+            self.session.resync()
+            self._log("Resync requested")
+            return
+        self.reset(reason="Resync")
 
     def reset(self, reason: str = "Manual reset") -> None:
         if self.session and self.session.is_alive():
@@ -1457,6 +1569,8 @@ class MAFApp(tk.Tk):
                     self.status_var.set(text)
                     if not text.startswith("Running:") or "blocks/s" not in text:
                         self._log(text)
+                elif event[0] == "status_bar" and len(event) >= 2:
+                    self.status_var.set(str(event[1]))
                 elif event[0] == "device_status" and len(event) >= 3:
                     name = str(event[1])
                     text = str(event[2])
@@ -1477,10 +1591,15 @@ class MAFApp(tk.Tk):
 
         if self.session and not self.session.is_alive():
             self.settings.set_delay_floor_ms(0.0)
+            if not self._reset_pending and self._should_auto_restart_native():
+                self._reset_pending = True
+                self._restart_scheduled = False
+                self._log("Native engine stopped unexpectedly; restarting")
             if self._reset_pending:
                 self.start_button.configure(state=tk.DISABLED)
                 self.stop_button.configure(state=tk.DISABLED)
                 self.reset_button.configure(state=tk.DISABLED)
+                self.resync_button.configure(state=tk.DISABLED)
                 if not self._restart_scheduled:
                     self._restart_scheduled = True
                     self.after(RESET_RESTART_DELAY_MS, self._restart_after_reset)
@@ -1490,12 +1609,25 @@ class MAFApp(tk.Tk):
                 self.start_button.configure(state=tk.NORMAL)
                 self.stop_button.configure(state=tk.DISABLED)
                 self.reset_button.configure(state=tk.DISABLED)
+                self.resync_button.configure(state=tk.DISABLED)
                 self._dragging_reports.clear()
                 if not (current_status.startswith("Error:") or current_status.startswith("Output failed:")):
                     self.status_var.set("Stopped")
                     self._log("Stopped")
 
         self.after(200, self._poll_status)
+
+    def _should_auto_restart_native(self) -> bool:
+        if not (isinstance(self.session, NativeFanoutSession) and self.session.unexpected_exit):
+            return False
+        now = time.monotonic()
+        while self._native_restarts and now - self._native_restarts[0] > NATIVE_AUTO_RESTART_WINDOW_SECONDS:
+            self._native_restarts.popleft()
+        if len(self._native_restarts) >= NATIVE_AUTO_RESTART_LIMIT:
+            self._log("Native engine keeps stopping; not restarting again automatically")
+            return False
+        self._native_restarts.append(now)
+        return True
 
     def _on_close(self) -> None:
         self.stop()
