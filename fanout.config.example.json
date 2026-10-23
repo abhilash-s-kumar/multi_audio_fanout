@@ -1,0 +1,10 @@
+{
+  "source": "Speakers (MAF Virtual Audio Output)",
+  "source_kind": "loopback",
+  "outputs": [
+    "Realtek",
+    "Soundcore"
+  ],
+  "include_default": false,
+  "all": false
+}
