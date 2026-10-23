@@ -33,6 +33,7 @@ namespace {
 // Capture side.
 constexpr REFERENCE_TIME kCaptureBufferDuration = 2000000; // 200 ms in 100 ns units.
 constexpr DWORD kCaptureRetryMs = 500;
+constexpr int kLevelIntervalMs = 50;     // "lvl" lines for the GUI level meters.
 
 // Render side. Each output keeps "ring buffer + device buffer" at a common target latency,
 // so every speaker plays a captured sample the same time after it was captured.
@@ -646,6 +647,9 @@ public:
     // Smoothed time from pushing a frame into the ring until it leaves the device buffer.
     double pc_latency_seconds() const { return latency_ms_.load() / 1000.0; }
 
+    // Highest sample level this output played since the previous call (0..1).
+    float take_peak() { return peak_.exchange(0.0f); }
+
     bool is_playing() const {
         const auto state = state_.load();
         return state == OutputState::Settling || state == OutputState::Locked || state == OutputState::Free;
@@ -1129,6 +1133,7 @@ private:
         const ChannelMode mode = channel_mode_.load();
         // Calibration sweeps play at their own fixed level, independent of the volume sliders.
         const float gain = g_calibration_active.load() ? 1.0f : gain_.load() * g_master_gain.load();
+        float peak = 0.0f;
         for (UINT32 i = 0; i < frames; ++i) {
             float left = 0.0f;
             float right = 0.0f;
@@ -1143,7 +1148,13 @@ private:
                 frame_gain *= 1.0f - (static_cast<float>(fade_remaining_) / static_cast<float>(fade_total_));
                 --fade_remaining_;
             }
-            write_frame(buffer, i, std::clamp(left * frame_gain, -1.0f, 1.0f), std::clamp(right * frame_gain, -1.0f, 1.0f));
+            left = std::clamp(left * frame_gain, -1.0f, 1.0f);
+            right = std::clamp(right * frame_gain, -1.0f, 1.0f);
+            peak = std::max(peak, std::max(std::fabs(left), std::fabs(right)));
+            write_frame(buffer, i, left, right);
+        }
+        float previous = peak_.load();
+        while (peak > previous && !peak_.compare_exchange_weak(previous, peak)) {
         }
     }
 
@@ -1222,6 +1233,7 @@ private:
 
     // Shared with the capture and control threads.
     std::atomic<float> gain_ = 1.0f;
+    std::atomic<float> peak_ = 0.0f;
     std::atomic<ChannelMode> channel_mode_ = ChannelMode::Stereo;
     std::atomic<double> raw_delay_ms_ = 0.0;
     std::atomic<double> offset_ms_ = 0.0;
@@ -2765,6 +2777,7 @@ int run_engine(const Args& args) {
     int exit_code = 0;
     const auto started_at = std::chrono::steady_clock::now();
     auto last_status = started_at;
+    auto last_level = started_at;
     auto last_reopen_attempt = started_at;
     bool calibrate_at_start = args.calibrate;
     std::thread calibration_thread;
@@ -2826,6 +2839,15 @@ int run_engine(const Args& args) {
             Sleep(2);
         }
 
+        if (now - last_level >= std::chrono::milliseconds(kLevelIntervalMs)) {
+            last_level = now;
+            std::wostringstream levels;
+            levels << L"lvl" << std::fixed << std::setprecision(4);
+            for (auto& output : *outputs) {
+                levels << L' ' << output->take_peak();
+            }
+            log_line(levels.str());
+        }
         if (now - last_status >= std::chrono::seconds(1)) {
             last_status = now;
             log_line(L"src state=" + std::wstring(capture.is_open() ? L"running" : L"waiting") +

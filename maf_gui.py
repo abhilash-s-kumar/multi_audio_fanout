@@ -60,6 +60,10 @@ NATIVE_AUTO_RESTART_LIMIT = 3
 NATIVE_AUTO_RESTART_WINDOW_SECONDS = 60.0
 VISUALIZER_REFRESH_MS = 33
 VISUALIZER_DECAY = 0.94
+METER_FLOOR_DB = -60.0
+# Name fragments of virtual audio devices, and the one input of each that is a sensible source.
+VIRTUAL_DEVICE_MARKERS = ("vb-audio", "voicemeeter", "virtual audio cable", "virtual cable")
+VIRTUAL_MAIN_INPUTS = ("voicemeeter input", "cable input")
 SETTINGS_PATH = Path(os.environ.get("APPDATA", str(Path.home()))) / "MAF" / "settings.json"
 AVRT_PRIORITY_NORMAL = 0
 AVRT_PRIORITY_HIGH = 1
@@ -85,6 +89,31 @@ def native_engine_path() -> Path:
 
 def is_maf_endpoint(name: str) -> bool:
     return MAF_ENDPOINT_MARKER.casefold() in name.casefold()
+
+
+def is_virtual_endpoint(name: str) -> bool:
+    """Virtual cables and mixers (Voicemeeter, VB-Cable, ...): never a real speaker."""
+    folded = name.casefold()
+    return any(marker in folded for marker in VIRTUAL_DEVICE_MARKERS)
+
+
+def is_listed_source(source: SourceItem, loopback_only: bool) -> bool:
+    """Sources worth offering: the MAF output, real devices, and one main input per virtual tool."""
+    if loopback_only and not source.is_loopback:
+        return False
+    if is_maf_endpoint(source.name):
+        return True
+    if is_virtual_endpoint(source.name):
+        return source.is_loopback and source.name.casefold().startswith(VIRTUAL_MAIN_INPUTS)
+    return True
+
+
+def meter_fraction(level: float) -> float:
+    """Linear level (0..1) to bar length on a dB scale, so quiet music still shows."""
+    if level <= 0.0:
+        return 0.0
+    db = 20.0 * np.log10(level)
+    return float(min(1.0, max(0.0, (db - METER_FLOOR_DB) / -METER_FLOOR_DB)))
 
 
 def compact_text(value: str, limit: int) -> str:
@@ -621,7 +650,7 @@ class FanoutSession(threading.Thread):
                         self.status_queue.put((
                             "device_level",
                             worker.control.item.name,
-                            min(1.0, block_level * 1.4),
+                            min(1.0, block_level * 1.4142),
                         ))
                     blocks += 1
 
@@ -753,6 +782,16 @@ class NativeFanoutSession(threading.Thread):
             if not text:
                 continue
             parts = text.split()
+            if parts[0] == "lvl":
+                # Peak level of each output since the previous line, in output order.
+                for index, value in enumerate(parts[1:]):
+                    if index < len(self.controls):
+                        try:
+                            level = float(value)
+                        except ValueError:
+                            continue
+                        self.status_queue.put(("device_level", self.controls[index].item.name, level))
+                continue
             if parts[0] == "dev" and len(parts) >= 2 and parts[1].isdigit():
                 index = int(parts[1])
                 if index < len(self.controls):
@@ -1124,17 +1163,22 @@ class MAFApp(tk.Tk):
             top = index * row_height + 4
             center = top + row_height // 2
             name = compact_text(control.item.name, 18)
-            level = min(1.0, max(0.0, self.output_levels.get(control.item.name, 0.0)))
+            level = meter_fraction(self.output_levels.get(control.item.name, 0.0))
             canvas.create_text(4, center, text=name, anchor="w", fill="#333")
             canvas.create_rectangle(bar_left, center - 5, bar_right, center + 5, outline="#aaa")
-            canvas.create_rectangle(
-                bar_left,
-                center - 5,
-                bar_left + int((bar_right - bar_left) * level),
-                center + 5,
-                fill="#3a7",
-                outline="",
-            )
+            # Green up to -12 dBFS, amber to -3 dBFS, red above.
+            span = bar_right - bar_left
+            for start_db, end_db, colour in ((METER_FLOOR_DB, -12.0, "#3a7"), (-12.0, -3.0, "#d9a400"), (-3.0, 0.0, "#d33")):
+                start = meter_fraction(10 ** (start_db / 20.0))
+                end = min(level, meter_fraction(10 ** (end_db / 20.0)))
+                if end > start:
+                    canvas.create_rectangle(
+                        bar_left + int(span * start), center - 5, bar_left + int(span * end), center + 5,
+                        fill=colour, outline="",
+                    )
+            for tick_db in (-40.0, -20.0, -6.0):
+                x = bar_left + int(span * meter_fraction(10 ** (tick_db / 20.0)))
+                canvas.create_line(x, center + 5, x, center + 8, fill="#999")
         for name in list(self.output_levels):
             self.output_levels[name] *= VISUALIZER_DECAY
             if self.output_levels[name] < 0.001:
@@ -1208,24 +1252,34 @@ class MAFApp(tk.Tk):
         self.unbind("<ButtonRelease-1>")
 
     def refresh_devices(self) -> None:
-        self.sources = [
+        previous_source = self.sources[self.source_combo.current()].name if self.sources and self.source_combo.current() >= 0 else None
+        # The native engine only captures playback devices (loopback); the Python engine can use inputs too.
+        loopback_only = native_engine_path().exists()
+        candidates = [
             SourceItem(
-                index=index,
+                index=0,
                 name=device_name(device),
                 device=device,
                 is_loopback=bool(getattr(device, "isloopback", False)),
             )
-            for index, device in enumerate(sc.all_microphones(include_loopback=True))
+            for device in sc.all_microphones(include_loopback=True)
         ]
+        self.sources = [source for source in candidates if is_listed_source(source, loopback_only)]
+        for index, source in enumerate(self.sources):
+            source.index = index
         connected_outputs = [
             OutputItem(index=index, name=device_name(device), device=device, connected=True)
             for index, device in enumerate(
-                device for device in sc.all_speakers() if not is_maf_endpoint(device_name(device))
+                device
+                for device in sc.all_speakers()
+                if not is_maf_endpoint(device_name(device)) and not is_virtual_endpoint(device_name(device))
             )
         ]
         connected_names = {output.name for output in connected_outputs}
         for name in connected_names:
             self.settings.remember_output(name)
+        for name in [name for name in self.settings.known_outputs if is_virtual_endpoint(name)]:
+            self.settings.forget_output(name)
         offline_outputs = [
             OutputItem(index=-1, name=name, device=None, connected=False)
             for name in sorted(self.settings.known_outputs - connected_names)
@@ -1233,7 +1287,8 @@ class MAFApp(tk.Tk):
         self.outputs = connected_outputs + offline_outputs
 
         self.source_combo["values"] = [source.label for source in self.sources]
-        preferred = self._preferred_source_index()
+        kept = next((i for i, source in enumerate(self.sources) if source.name == previous_source), None)
+        preferred = kept if kept is not None else self._preferred_source_index()
         if preferred is not None:
             self.source_combo.current(preferred)
         elif self.sources:
@@ -1252,6 +1307,9 @@ class MAFApp(tk.Tk):
                 return index
         for index, source in enumerate(self.sources):
             if is_maf_endpoint(source.name) and source.is_loopback:
+                return index
+        for index, source in enumerate(self.sources):
+            if source.is_loopback and source.name.casefold().startswith(VIRTUAL_MAIN_INPUTS):
                 return index
         for index, source in enumerate(self.sources):
             if "Virtual Audio Cable" in source.name and not source.is_loopback:
