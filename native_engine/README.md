@@ -72,7 +72,7 @@ then `done` or `fail` with `code` and `detail`.
 Install Visual Studio 2022 Build Tools with C++ desktop development, then:
 
 ```powershell
-cd E:\multi_audio_fanout_v2\native_engine
+cd <path to multi_audio_fanout>\native_engine
 cmake -S . -B build -G "Visual Studio 17 2022" -A x64
 cmake --build build --config Release
 copy build\Release\maf_native_engine.exe .

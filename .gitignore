@@ -5,3 +5,4 @@ dist/
 __pycache__/
 native_engine/build/
 *.exe
+tablet_preprocessed*.xml

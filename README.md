@@ -34,7 +34,7 @@ permission). MAF opens this window by itself when the driver is missing.
 Manually, open PowerShell as Administrator:
 
 ```powershell
-cd E:\multi_audio_fanout_v2
+cd <path to multi_audio_fanout>
 powershell -ExecutionPolicy Bypass -File .\install_maf_driver.ps1
 ```
 
