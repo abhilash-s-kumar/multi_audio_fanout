@@ -223,6 +223,7 @@ class AudioSettings:
         self.sync_enabled = True
         self.auto_reset_enabled = False
         self.output_name_width = DEFAULT_OUTPUT_NAME_WIDTH
+        self.calibration_mic = ""  # Empty: the engine picks the default / built-in microphone.
         self.delay_floor_ms = 0.0
         self.output_volume: dict[str, float] = {}
         self.output_delay_ms: dict[str, float] = {}
@@ -245,6 +246,8 @@ class AudioSettings:
                     MAX_OUTPUT_NAME_WIDTH,
                     max(MIN_OUTPUT_NAME_WIDTH, int(data["output_name_width"])),
                 )
+            if isinstance(data.get("calibration_mic"), str):
+                self.calibration_mic = data["calibration_mic"]
             outputs = data.get("outputs", {})
             if not isinstance(outputs, dict):
                 return
@@ -278,6 +281,7 @@ class AudioSettings:
                     "sync_enabled": self.sync_enabled,
                     "auto_reset_enabled": self.auto_reset_enabled,
                     "output_name_width": self.output_name_width,
+                    "calibration_mic": self.calibration_mic,
                     "outputs": {
                         name: {
                             "volume": self.output_volume.get(name, 1.0),
@@ -664,6 +668,7 @@ class NativeFanoutSession(threading.Thread):
         master_gain: float,
         sync_enabled: bool,
         latency_ms: float = NATIVE_LATENCY_MS,
+        calibration_mic: str = "",
     ) -> None:
         super().__init__(name="maf-native-engine", daemon=True)
         self.source = source
@@ -674,6 +679,7 @@ class NativeFanoutSession(threading.Thread):
         self.master_gain = max(0.0, float(master_gain))
         self.sync_enabled = bool(sync_enabled)
         self.latency_ms = float(latency_ms)
+        self.calibration_mic = calibration_mic
         self.process: subprocess.Popen[str] | None = None
         self.unexpected_exit = False
         self._control_lock = threading.Lock()
@@ -717,6 +723,12 @@ class NativeFanoutSession(threading.Thread):
     def resync(self) -> None:
         self._send_control("resync")
 
+    def calibrate(self) -> None:
+        self._send_control("calibrate")
+
+    def mic_check(self) -> None:
+        self._send_control("miccheck")
+
     @staticmethod
     def _device_status_text(fields: dict[str, str]) -> str:
         state = fields.get("state", "?")
@@ -750,6 +762,17 @@ class NativeFanoutSession(threading.Thread):
                         self._device_status_text(fields),
                     ))
                 continue
+            if parts[0] == "cal" and len(parts) >= 2:
+                try:
+                    event = json.loads(text[4:])
+                except ValueError:
+                    event = None
+                if isinstance(event, dict):
+                    index = event.get("index")
+                    if isinstance(index, int) and 0 <= index < len(self.controls):
+                        event["name"] = self.controls[index].item.name
+                    self.status_queue.put(("calibration", event))
+                    continue
             if parts[0] == "src" and len(parts) >= 2 and parts[1].startswith("state="):
                 if parts[1] != "state=running":
                     self.status_queue.put(("status_bar", "Waiting for the MAF source..."))
@@ -796,6 +819,8 @@ class NativeFanoutSession(threading.Thread):
         ]
         if not self.sync_enabled:
             args.append("--no-sync")
+        if self.calibration_mic:
+            args.extend(["--mic", self.calibration_mic])
         for control in self.controls:
             mode = control.channel_mode.get().lower()
             gain = max(0.0, float(control.volume.get()))
@@ -872,6 +897,7 @@ class MAFApp(tk.Tk):
         self._dragging_reports: dict[str, int] = {}
         self._last_auto_reset = 0.0
         self._native_restarts: deque[float] = deque()
+        self._calibration_report: list[str] = []
         self._name_resize_start_x = 0
         self._name_resize_start_width = self.output_name_width
 
@@ -987,6 +1013,10 @@ class MAFApp(tk.Tk):
         self.reset_button.pack(side=tk.LEFT, padx=(8, 0))
         self.resync_button = ttk.Button(bottom, text="Resync", command=self.resync, state=tk.DISABLED)
         self.resync_button.pack(side=tk.LEFT, padx=(8, 0))
+        self.mic_check_button = ttk.Button(bottom, text="Test Mic", command=self.mic_check, state=tk.DISABLED)
+        self.mic_check_button.pack(side=tk.LEFT, padx=(8, 0))
+        self.calibrate_button = ttk.Button(bottom, text="Calibrate", command=self.calibrate, state=tk.DISABLED)
+        self.calibrate_button.pack(side=tk.LEFT, padx=(8, 0))
         self.sync_button = ttk.Button(bottom, textvariable=self.sync_button_text, command=self._toggle_sync)
         self.sync_button.pack(side=tk.LEFT, padx=(8, 0))
         ttk.Checkbutton(
@@ -1475,6 +1505,7 @@ class MAFApp(tk.Tk):
                 engine_path=engine_path,
                 master_gain=self.master_volume.get(),
                 sync_enabled=self.sync_enabled.get(),
+                calibration_mic=self.settings.calibration_mic,
             )
             self._log(f"Using native engine: {engine_path}")
         else:
@@ -1491,6 +1522,7 @@ class MAFApp(tk.Tk):
         self.stop_button.configure(state=tk.NORMAL)
         self.reset_button.configure(state=tk.NORMAL)
         self.resync_button.configure(state=tk.NORMAL)
+        self._set_calibration_buttons(isinstance(self.session, NativeFanoutSession))
         self.status_var.set("Starting...")
         self.output_levels = {control.item.name: 0.0 for control in selected}
         self._log("Started fanout: " + ", ".join(control.item.name for control in selected))
@@ -1503,8 +1535,85 @@ class MAFApp(tk.Tk):
         self.stop_button.configure(state=tk.DISABLED)
         self.reset_button.configure(state=tk.DISABLED)
         self.resync_button.configure(state=tk.DISABLED)
+        self._set_calibration_buttons(False)
         self.status_var.set(status)
         self._log(status)
+
+    def _set_calibration_buttons(self, enabled: bool) -> None:
+        state = tk.NORMAL if enabled else tk.DISABLED
+        self.mic_check_button.configure(state=state)
+        self.calibrate_button.configure(state=state)
+
+    def mic_check(self) -> None:
+        if isinstance(self.session, NativeFanoutSession) and self.session.is_alive():
+            self.session.mic_check()
+
+    def calibrate(self) -> None:
+        if not (isinstance(self.session, NativeFanoutSession) and self.session.is_alive()):
+            return
+        if not messagebox.askokcancel(
+            APP_NAME,
+            "Calibration mutes the music for about 12 seconds and plays a short sweep on each speaker, "
+            "three times.\n\nPut the laptop where you usually listen, keep the room quiet, then press OK.",
+        ):
+            return
+        self.session.calibrate()
+
+    def _handle_calibration_event(self, event: dict) -> None:
+        kind = event.get("event")
+        name = str(event.get("name", ""))
+        detail = str(event.get("detail", ""))
+        if kind == "start":
+            self._calibration_report = []
+            self._set_calibration_buttons(False)
+            if event.get("mode") == "calibrate":
+                self._log("Calibration started")
+                self.status_var.set("Calibrating: checking the microphone...")
+            else:
+                self._log("Microphone test started")
+                self.status_var.set("Testing the microphone...")
+        elif kind == "mic":
+            raw = " (unprocessed)" if event.get("raw") else ""
+            self._log(f"Microphone: {name}{raw}")
+        elif kind == "warning":
+            self._calibration_report.append(f"Warning: {detail}")
+            self._log(f"Microphone warning: {detail}")
+        elif kind == "mic_ok":
+            self._log(f"Microphone OK, level {event.get('level_dbfs', 0):.0f} dBFS")
+        elif kind == "playing":
+            self.status_var.set("Calibrating: playing sweeps...")
+        elif kind == "dev":
+            status = event.get("status")
+            if status == "ok":
+                line = f"{name}: {event.get('latency_ms', 0):.1f} ms (spread {event.get('spread_ms', 0):.1f} ms)"
+            elif status == "unknown":
+                return
+            else:
+                line = f"{name}: {detail}"
+            self._calibration_report.append(line)
+            self._log(f"Calibration {line}")
+        elif kind == "delay":
+            for control in self.controls:
+                if control.item.name == name:
+                    control.delay_ms.set(round(float(event.get("ms", 0.0)), 1))
+                    break
+            self._calibration_report.append(f"{name}: delay set to {event.get('ms', 0):.1f} ms")
+        elif kind in ("done", "fail"):
+            self._set_calibration_buttons(isinstance(self.session, NativeFanoutSession) and self.session.is_alive())
+            code = str(event.get("code", ""))
+            report = "\n".join(self._calibration_report)
+            message = detail + (f"\n\n{report}" if report else "")
+            self._log(f"Calibration {kind}: {code} {detail}")
+            self.status_var.set(detail)
+            if kind == "fail" and code == "STOPPED":
+                return
+            if kind == "fail":
+                title = "Microphone problem" if code.startswith("MIC_") else "Calibration failed"
+                messagebox.showwarning(title, message)
+            elif event.get("applied") or code == "MIC_OK":
+                messagebox.showinfo(APP_NAME, message)
+            else:
+                messagebox.showwarning(APP_NAME, message)
 
     def resync(self) -> None:
         # Native engine: realign every output in place, without reopening the speakers.
@@ -1571,6 +1680,8 @@ class MAFApp(tk.Tk):
                         self._log(text)
                 elif event[0] == "status_bar" and len(event) >= 2:
                     self.status_var.set(str(event[1]))
+                elif event[0] == "calibration" and len(event) >= 2 and isinstance(event[1], dict):
+                    self._handle_calibration_event(event[1])
                 elif event[0] == "device_status" and len(event) >= 3:
                     name = str(event[1])
                     text = str(event[2])
@@ -1600,6 +1711,7 @@ class MAFApp(tk.Tk):
                 self.stop_button.configure(state=tk.DISABLED)
                 self.reset_button.configure(state=tk.DISABLED)
                 self.resync_button.configure(state=tk.DISABLED)
+                self._set_calibration_buttons(False)
                 if not self._restart_scheduled:
                     self._restart_scheduled = True
                     self.after(RESET_RESTART_DELAY_MS, self._restart_after_reset)
@@ -1610,6 +1722,7 @@ class MAFApp(tk.Tk):
                 self.stop_button.configure(state=tk.DISABLED)
                 self.reset_button.configure(state=tk.DISABLED)
                 self.resync_button.configure(state=tk.DISABLED)
+                self._set_calibration_buttons(False)
                 self._dragging_reports.clear()
                 if not (current_status.startswith("Error:") or current_status.startswith("Output failed:")):
                     self.status_var.set("Stopped")
